@@ -1235,13 +1235,11 @@ export default function (pi: ExtensionAPI) {
 				if (item.type === "assistant") body.push("");
 			}
 
-			// The pane covers everything above the editor + widget + footer.
-			// Manual tail windowing: overlays get no viewport from the TUI and
-			// maxHeight truncates from the top, so slice the tail ourselves.
+			// In-document widget: size to content, capped so the transcript
+			// above and the chrome below stay reachable on small terminals.
 			const rows = this.tui.terminal.rows;
-			// The widget renders panelRows() whenever a view is open.
-			const bottomChrome = 8 + panelRows().length; // editor+footer+widget+hints
-			const visibleCount = Math.max(3, rows - bottomChrome - 2);
+			const maxBody = Math.max(6, rows - 14);
+			const visibleCount = Math.min(maxBody, Math.max(1, body.length));
 			this.scrollBack = Math.max(
 				0,
 				Math.min(this.scrollBack, Math.max(0, body.length - visibleCount)),
@@ -1250,6 +1248,7 @@ export default function (pi: ExtensionAPI) {
 			const visible = body.slice(Math.max(0, end - visibleCount), end);
 
 			const lines: string[] = [];
+			lines.push(t.fg("dim", "─".repeat(Math.max(1, Math.min(width, 200)))));
 			if (end - visibleCount > 0) {
 				lines.push(
 					t.fg(
@@ -1265,8 +1264,6 @@ export default function (pi: ExtensionAPI) {
 				lines.push(
 					t.fg("dim", ` ↓ ${this.scrollBack} more line(s) (pageDown)`),
 				);
-			// Pad so the pane fully covers the main transcript behind it.
-			while (lines.length < visibleCount + 3) lines.push("");
 			return lines;
 		}
 
@@ -1281,6 +1278,7 @@ export default function (pi: ExtensionAPI) {
 			this.disposed = true;
 			if (this.fork.onTranscriptUpdate)
 				this.fork.onTranscriptUpdate = undefined;
+			if (viewPane === this) viewPane = undefined;
 		}
 	}
 
@@ -1290,42 +1288,41 @@ export default function (pi: ExtensionAPI) {
 	 * messages to the fork — Claude Code's transcript-replacement UX.
 	 */
 	let viewPane: ForkPane | undefined;
-	let viewDone: (() => void) | undefined;
 
 	function enterForkView(fork: Fork) {
 		const ctx = lastCtx;
 		if (!ctx || ctx.mode !== "tui" || !ctx.hasUI || viewPane) return;
-		void (async () => {
-			try {
-				await ctx.ui.custom<undefined>(
-					(tui, theme, _kb, done) => {
-						const pane = new ForkPane(tui, theme, fork);
-						viewPane = pane;
-						viewDone = () => done(undefined);
-						return pane;
-					},
-					{
-						overlay: true,
-						overlayOptions: {
-							width: "100%",
-							anchor: "top-left",
-							margin: 0,
-							// Focus stays in pi's real editor; the pane only displays.
-							nonCapturing: true,
-						},
-					},
-				);
-			} finally {
-				viewPane = undefined;
-				viewDone = undefined;
-				renderWidget(true);
-			}
-		})();
+		try {
+			// The view is a widget above the editor, not an overlay: it lives
+			// inside pi's document, so the editor/panel/footer below it can
+			// never be covered regardless of terminal height, and pi handles
+			// all layout. (An overlay is positioned against the viewport while
+			// the inline document hugs the top, which buried the chrome on
+			// tall terminals with short sessions.)
+			ctx.ui.setWidget(
+				"subtask-view",
+				(tui, theme) => {
+					const pane = new ForkPane(tui, theme, fork);
+					viewPane = pane;
+					return pane;
+				},
+				{ placement: "aboveEditor" },
+			);
+		} catch {
+			/* stale ctx across session replacement */
+		}
 		renderWidget(true);
 	}
 
 	function exitForkView() {
-		viewDone?.();
+		if (!viewPane) return;
+		viewPane = undefined;
+		try {
+			lastCtx?.ui.setWidget("subtask-view", undefined);
+		} catch {
+			/* stale ctx */
+		}
+		renderWidget(true);
 	}
 
 	function stopOrDismissFork(fork: Fork) {
