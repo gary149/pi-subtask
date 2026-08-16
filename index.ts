@@ -155,12 +155,16 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
+/** Usage line in pi's own footer format: ↑in ↓out Rcache CH% $cost. */
 function formatUsage(usage: ForkUsage): string {
 	const parts: string[] = [];
-	if (usage.turns)
-		parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
 	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
+	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+	const promptTokens = usage.input + usage.cacheRead;
+	if (usage.cacheRead && promptTokens > 0) {
+		parts.push(`CH${((usage.cacheRead / promptTokens) * 100).toFixed(1)}%`);
+	}
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
 	return parts.join(" ");
 }
