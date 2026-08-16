@@ -1,0 +1,42 @@
+{
+	"name": "pi-subtask",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Fork the current conversation into a background subagent that reports back. /subtask for pi, inspired by Claude Code's forked subagents.",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-extension",
+		"pi-coding-agent",
+		"subagent",
+		"subtask",
+		"fork",
+		"coding-agent"
+	],
+	"license": "MIT",
+	"author": "Victor Mustar",
+	"homepage": "https://github.com/gary149/pi-subtask#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gary149/pi-subtask.git"
+	},
+	"bugs": {
+		"url": "https://github.com/gary149/pi-subtask/issues"
+	},
+	"engines": {
+		"node": ">=22"
+	},
+	"files": [
+		"index.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	}
+}
