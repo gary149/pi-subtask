@@ -530,14 +530,50 @@ export default function (pi: ExtensionAPI) {
 	 * main row, i >= 1 = widgetRows()[i - 1]. Driven by the editor wrapper.
 	 */
 	let panelSel: number | null = null;
+	/**
+	 * Selection identity: "main", a fork id, or null (not navigating). The
+	 * numeric panelSel is derived from it each render so the cursor follows a
+	 * fork when the list reorders (e.g. a stopped fork sinking to the finished
+	 * section) instead of silently landing on whichever fork took its row.
+	 */
+	let panelSelId: "main" | number | null = null;
+
+	/** Re-derive the numeric selection from identity against current rows. */
+	function syncPanelSel(rows: Fork[]) {
+		if (panelSelId === null) {
+			panelSel = null;
+			return;
+		}
+		if (panelSelId === "main") {
+			panelSel = 0;
+			return;
+		}
+		const i = rows.findIndex((f) => f.id === panelSelId);
+		if (i >= 0) {
+			panelSel = i + 1;
+		} else {
+			// Selected fork vanished (dismissed/trimmed): fall back to main.
+			panelSelId = "main";
+			panelSel = 0;
+		}
+	}
+
+	function selectRow(rows: Fork[], index: number) {
+		const clamped = Math.max(0, Math.min(rows.length, index));
+		panelSelId = clamped === 0 ? "main" : (rows[clamped - 1]?.id ?? "main");
+		panelSel = clamped;
+	}
+
+	function clearSelection() {
+		panelSel = null;
+		panelSelId = null;
+	}
 
 	function widgetLines(width: number): string[] {
 		// Focused: every retained fork (aged-out finished ones included, like
 		// Claude Code's /tasks). Idle: only recent rows.
-		const rows = panelSel === null && !viewPane ? widgetRows() : panelRows();
-		if (panelSel !== null && panelSel > rows.length) {
-			panelSel = rows.length;
-		}
+		const rows = panelSelId === null && !viewPane ? widgetRows() : panelRows();
+		syncPanelSel(rows);
 		const viewedId = viewPane?.fork.id;
 		const hint = viewPane
 			? `viewing @${viewPane.fork.name} — typing goes to the fork · ↓ switch · esc back to main`
@@ -597,11 +633,11 @@ export default function (pi: ExtensionAPI) {
 	let widgetTui: TUI | undefined;
 	let widgetVisible = false;
 
-	function renderWidget() {
+	function renderWidget(force = false) {
 		if (!lastCtx?.hasUI) return;
 		try {
 			const visibleRows =
-				panelSel !== null || viewPane ? panelRows() : widgetRows();
+				panelSelId !== null || viewPane ? panelRows() : widgetRows();
 			if (visibleRows.length === 0) {
 				if (widgetVisible) {
 					lastCtx.ui.setWidget("subtasks", undefined);
@@ -627,7 +663,9 @@ export default function (pi: ExtensionAPI) {
 					{ placement: "belowEditor" },
 				);
 			} else {
-				widgetTui?.requestRender();
+				// A forced render repaints the whole screen, clearing any stale
+				// lines the terminal may have orphaned during rapid transitions.
+				widgetTui?.requestRender(force);
 			}
 		} catch {
 			// UI context can go stale across session replacement; drop the update.
@@ -1267,10 +1305,10 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				viewPane = undefined;
 				viewDone = undefined;
-				renderWidget();
+				renderWidget(true);
 			}
 		})();
-		renderWidget();
+		renderWidget(true);
 	}
 
 	function exitForkView() {
@@ -1298,32 +1336,34 @@ export default function (pi: ExtensionAPI) {
 			if (viewPane) {
 				// Arrow navigation still works: select another row and switch
 				// the view in place (main row exits to the main conversation).
-				if (panelSel !== null) {
+				if (panelSelId !== null) {
 					const rows = panelRows();
+					syncPanelSel(rows);
+					const idx = panelSel ?? 0;
 					if (matchesKey(data, "up")) {
-						panelSel = Math.max(0, panelSel - 1);
+						selectRow(rows, idx - 1);
 					} else if (matchesKey(data, "down")) {
-						panelSel = Math.min(rows.length, panelSel + 1);
+						selectRow(rows, idx + 1);
 					} else if (matchesKey(data, "return")) {
-						const target = panelSel > 0 ? rows[panelSel - 1] : undefined;
-						panelSel = null;
+						const target = idx > 0 ? rows[idx - 1] : undefined;
+						clearSelection();
 						if (!target) exitForkView();
 						else if (target.id !== viewPane.fork.id) viewPane.setFork(target);
 					} else if (matchesKey(data, "escape")) {
-						panelSel = null;
-					} else if (matchesKey(data, "x") && panelSel > 0) {
-						const fork = rows[panelSel - 1];
+						clearSelection();
+					} else if (matchesKey(data, "x") && idx > 0) {
+						const fork = rows[idx - 1];
+						// Identity-tracked: the cursor follows this fork through
+						// the reorder, so a second x acts on the SAME fork.
 						if (fork) stopOrDismissFork(fork);
-						const remaining = panelRows().length;
-						if (panelSel > remaining)
-							panelSel = remaining > 0 ? remaining : null;
+						syncPanelSel(panelRows());
 					} else {
-						panelSel = null;
-						renderWidget();
+						clearSelection();
+						renderWidget(true);
 						super.handleInput(data);
 						return;
 					}
-					renderWidget();
+					renderWidget(true);
 					return;
 				}
 				if (
@@ -1333,8 +1373,8 @@ export default function (pi: ExtensionAPI) {
 				) {
 					// Enter navigation at the top (main), same as outside a view:
 					// one down + enter always returns to the main conversation.
-					panelSel = 0;
-					renderWidget();
+					selectRow(panelRows(), 0);
+					renderWidget(true);
 					return;
 				}
 				if (matchesKey(data, "escape")) {
@@ -1366,46 +1406,50 @@ export default function (pi: ExtensionAPI) {
 				super.handleInput(data);
 				return;
 			}
-			if (panelSel === null) {
+			if (panelSelId === null) {
 				if (
 					matchesKey(data, "down") &&
 					this.getText() === "" &&
 					forks.size > 0
 				) {
-					panelSel = 0;
-					renderWidget();
+					selectRow(panelRows(), 0);
+					renderWidget(true);
 					return;
 				}
 				super.handleInput(data);
 				return;
 			}
 			const rows = panelRows();
+			syncPanelSel(rows);
+			const idx = panelSel ?? 0;
 			if (matchesKey(data, "up")) {
-				panelSel = panelSel === 0 ? null : panelSel - 1;
+				if (idx === 0) clearSelection();
+				else selectRow(rows, idx - 1);
 			} else if (matchesKey(data, "down")) {
-				panelSel = Math.min(rows.length, panelSel + 1);
+				selectRow(rows, idx + 1);
 			} else if (matchesKey(data, "escape")) {
-				panelSel = null;
+				clearSelection();
 			} else if (matchesKey(data, "return")) {
-				const fork = panelSel > 0 ? rows[panelSel - 1] : undefined;
-				panelSel = null;
-				renderWidget();
+				const fork = idx > 0 ? rows[idx - 1] : undefined;
+				clearSelection();
+				renderWidget(true);
 				if (fork) enterForkView(fork);
 				return;
-			} else if (matchesKey(data, "x") && panelSel > 0) {
-				const fork = rows[panelSel - 1];
+			} else if (matchesKey(data, "x") && idx > 0) {
+				const fork = rows[idx - 1];
+				// Identity-tracked: the cursor follows the stopped fork through
+				// the reorder; a second x dismisses the same fork.
 				if (fork) stopOrDismissFork(fork);
-				const remaining = panelRows().length;
-				if (panelSel > remaining) panelSel = remaining > 0 ? remaining : null;
+				syncPanelSel(panelRows());
 			} else {
 				// Any other key returns focus to the editor and types normally,
 				// like Claude Code's panel (x on the main row included).
-				panelSel = null;
-				renderWidget();
+				clearSelection();
+				renderWidget(true);
 				super.handleInput(data);
 				return;
 			}
-			renderWidget();
+			renderWidget(true);
 		}
 
 		render(width: number): string[] {
@@ -1659,7 +1703,7 @@ export default function (pi: ExtensionAPI) {
 		// New session, new UI: the widget must re-register itself.
 		widgetVisible = false;
 		widgetTui = undefined;
-		panelSel = null;
+		clearSelection();
 		// Inline panel navigation needs an editor wrapper; respect another
 		// extension's custom editor (modal-editor etc.) if one is installed.
 		// Without the wrapper there is no keyboard access to forks.
