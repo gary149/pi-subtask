@@ -184,7 +184,7 @@ function statusIcon(status: Fork["status"]): string {
 		case "starting":
 			return "○";
 		case "running":
-			return "◐";
+			return "✻";
 		case "done":
 			return "✓";
 		case "failed":
