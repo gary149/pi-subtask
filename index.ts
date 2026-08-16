@@ -44,7 +44,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Message, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Usage } from "@earendil-works/pi-ai";
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -52,8 +52,11 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
+	AssistantMessageComponent,
 	CustomEditor,
 	getMarkdownTheme,
+	ToolExecutionComponent,
+	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import {
@@ -86,13 +89,14 @@ interface ForkUsage {
 
 type TranscriptItem =
 	| { type: "user"; text: string; ts: number }
-	| { type: "assistant"; text: string; ts: number }
-	| { type: "tool"; name: string; args: Record<string, unknown>; ts: number }
+	| { type: "assistant"; text: string; message?: Message; ts: number }
 	| {
-			type: "tool_result";
+			type: "tool";
 			name: string;
-			ok: boolean;
-			summary: string;
+			toolCallId: string;
+			args: Record<string, unknown>;
+			result?: unknown;
+			isError?: boolean;
 			ts: number;
 	  }
 	| { type: "system"; text: string; ts: number };
@@ -210,29 +214,6 @@ function formatActivity(
 		default: {
 			const preview = JSON.stringify(args ?? {});
 			return `${toolName} ${preview.length > 40 ? `${preview.slice(0, 40)}...` : preview}`;
-		}
-	}
-}
-
-function formatToolLine(
-	toolName: string,
-	args: Record<string, unknown>,
-): string {
-	switch (toolName) {
-		case "bash":
-			return `$ ${String(args.command ?? "")}`;
-		case "read":
-		case "write":
-		case "edit":
-		case "ls":
-			return `${toolName} ${String(args.file_path ?? args.path ?? "")}`;
-		case "grep":
-			return `grep /${String(args.pattern ?? "")}/ in ${String(args.path ?? ".")}`;
-		case "find":
-			return `find ${String(args.pattern ?? "*")} in ${String(args.path ?? ".")}`;
-		default: {
-			const preview = JSON.stringify(args ?? {});
-			return `${toolName} ${preview.length > 80 ? `${preview.slice(0, 80)}...` : preview}`;
 		}
 	}
 }
@@ -909,40 +890,34 @@ export default function (pi: ExtensionAPI) {
 					pushTranscriptItem(fork, {
 						type: "tool",
 						name,
+						toolCallId: String(event.toolCallId ?? ""),
 						args,
 						ts: Date.now(),
 					});
 					break;
 				}
 				case "tool_execution_end": {
-					const name = String(event.toolName ?? "tool");
-					const result = event.result as
-						| { isError?: boolean; content?: unknown }
-						| undefined;
-					// isError lives on the event itself; the result's own flag is a
-					// fallback for older wire formats.
-					const ok = !(
-						(event.isError as boolean | undefined) ??
-						result?.isError ??
-						false
-					);
-					let summary = "";
-					if (Array.isArray(result?.content)) {
-						const text = result.content.find(
-							(c): c is { type: "text"; text: string } =>
-								typeof c === "object" &&
-								c !== null &&
-								(c as { type?: string }).type === "text",
+					// Attach the result to its tool item so the pane can render it
+					// with pi's own ToolExecutionComponent.
+					const toolCallId = String(event.toolCallId ?? "");
+					const item = [...fork.transcript]
+						.reverse()
+						.find(
+							(i): i is Extract<TranscriptItem, { type: "tool" }> =>
+								i.type === "tool" && i.toolCallId === toolCallId,
 						);
-						summary = (text?.text ?? "").split("\n")[0].slice(0, 80);
+					if (item) {
+						item.result = event.result;
+						// isError lives on the event itself; the result's own flag
+						// is a fallback for older wire formats.
+						item.isError = Boolean(
+							(event.isError as boolean | undefined) ??
+								(event.result as { isError?: boolean } | undefined)?.isError ??
+								false,
+						);
+						forkComponentCache.delete(item);
+						fork.onTranscriptUpdate?.();
 					}
-					pushTranscriptItem(fork, {
-						type: "tool_result",
-						name,
-						ok,
-						summary,
-						ts: Date.now(),
-					});
 					break;
 				}
 				case "message_end": {
@@ -971,6 +946,7 @@ export default function (pi: ExtensionAPI) {
 							pushTranscriptItem(fork, {
 								type: "assistant",
 								text,
+								message: msg,
 								ts: Date.now(),
 							});
 						}
@@ -1136,9 +1112,14 @@ export default function (pi: ExtensionAPI) {
 		return [...running, ...finished];
 	}
 
-	let mdCache = new WeakMap<
+	/**
+	 * Native renderer per transcript item: pi's own transcript components
+	 * (user-message box, assistant markdown, real tool rows), created lazily
+	 * and dropped on theme changes or when a tool's result arrives.
+	 */
+	let forkComponentCache = new WeakMap<
 		TranscriptItem,
-		{ width: number; lines: string[] }
+		{ render(width: number): string[] }
 	>();
 
 	/**
@@ -1183,44 +1164,36 @@ export default function (pi: ExtensionAPI) {
 
 		private itemLines(item: TranscriptItem, width: number): string[] {
 			const t = this.theme;
-			switch (item.type) {
-				case "user":
-					return [
-						t.fg(
-							"accent",
-							`› ${clipLine(item.text.replace(/\n/g, " "), width - 2)}`,
-						),
-					];
-				case "assistant": {
-					const cached = mdCache.get(item);
-					if (cached && cached.width === width) return cached.lines;
-					const lines = new Markdown(
-						item.text.trim(),
-						0,
-						0,
-						getMarkdownTheme(),
-					).render(width);
-					mdCache.set(item, { width, lines });
-					return lines;
-				}
-				case "tool":
-					return [
-						t.fg(
-							"muted",
-							`→ ${clipLine(formatToolLine(item.name, item.args), width - 2)}`,
-						),
-					];
-				case "tool_result": {
-					const icon = item.ok ? "✔" : "✘";
-					const text = clipLine(
-						`${icon} ${item.summary || item.name}`,
-						width - 2,
-					);
-					return [t.fg(item.ok ? "dim" : "error", `  ${text}`)];
-				}
-				case "system":
-					return [t.fg("dim", clipLine(item.text, width))];
+			if (item.type === "system") {
+				return [t.fg("dim", clipLine(item.text, width))];
 			}
+			let comp = forkComponentCache.get(item);
+			if (!comp) {
+				if (item.type === "user") {
+					comp = new UserMessageComponent(item.text);
+				} else if (item.type === "assistant") {
+					comp = item.message
+						? new AssistantMessageComponent(item.message as AssistantMessage)
+						: new Markdown(item.text.trim(), 1, 0, getMarkdownTheme());
+				} else {
+					const tool = new ToolExecutionComponent(
+						item.name,
+						item.toolCallId,
+						item.args,
+						{},
+						undefined,
+						this.tui,
+						this.fork.cwd,
+					);
+					tool.markExecutionStarted();
+					if (item.result !== undefined) {
+						tool.updateResult(item.result as never);
+					}
+					comp = tool;
+				}
+				forkComponentCache.set(item, comp);
+			}
+			return comp.render(width);
 		}
 
 		render(width: number): string[] {
@@ -1232,7 +1205,6 @@ export default function (pi: ExtensionAPI) {
 			const body: string[] = [];
 			for (const item of fork.transcript) {
 				for (const line of this.itemLines(item, contentWidth)) body.push(line);
-				if (item.type === "assistant") body.push("");
 			}
 
 			// In-document widget: size to content, capped so the transcript
@@ -1268,9 +1240,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		invalidate(): void {
-			// Styled markdown lines cache theme colors; drop them so theme
-			// changes repaint correctly.
-			mdCache = new WeakMap();
+			// Components cache theme colors internally; rebuild on theme change.
+			forkComponentCache = new WeakMap();
 		}
 
 		dispose(): void {
