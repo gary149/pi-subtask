@@ -22,11 +22,12 @@
  *                         the model spawn forks itself (on by default)
  *
  * Panel: press down on an empty prompt to select a fork directly in the
- * status rows below the editor (up/down move, enter opens the live viewer,
- * x stops/dismisses, esc or typing returns to the prompt). Alt+T opens the
- * same thing as a dock overlay. Inside the viewer, type + enter sends a
- * message to the fork (steers it while running, resumes it when finished),
- * pageUp/pageDown scroll, esc goes back.
+ * status rows below the editor (up/down move, x stops/dismisses, esc or
+ * typing returns to the prompt); enter replaces the main view with the
+ * fork's live transcript, Claude Code style: the prompt stays and is
+ * relabeled @fork - typing steers the fork while it runs or resumes it
+ * when finished, pageUp/pageDown scroll, esc returns to the main view.
+ * Alt+T opens the same rows as a dock overlay.
  *
  * Notes:
  * - Running forks appear in a panel below the editor.
@@ -58,11 +59,12 @@ import {
 import type { TUI } from "@earendil-works/pi-tui";
 import {
 	Container,
-	Input,
 	Markdown,
 	matchesKey,
 	Spacer,
 	Text,
+	truncateToWidth,
+	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
@@ -489,6 +491,7 @@ export default function (pi: ExtensionAPI) {
 	function widgetRows(): Fork[] {
 		// Finished rows age out of the widget but stay available in /subtasks.
 		return [...forks.values()].filter((f) => {
+			if (f.id === viewPane?.fork.id) return true;
 			if (!f.finishedAt) return true;
 			const linger =
 				f.status === "done" ? DONE_ROW_LINGER_MS : FAILED_ROW_LINGER_MS;
@@ -513,17 +516,21 @@ export default function (pi: ExtensionAPI) {
 		if (panelSel !== null && panelSel > rows.length) {
 			panelSel = rows.length;
 		}
-		const hint =
-			panelSel === null
+		const viewedId = viewPane?.fork.id;
+		const hint = viewPane
+			? `viewing @${viewPane.fork.name} — typing goes to the fork · esc back to main`
+			: panelSel === null
 				? `subtasks (${rows.length}) — ↓ to select · alt+t dock`
 				: "enter to view · x to stop/dismiss · esc back";
 		const lines = [clipLine(hint, width)];
-		lines.push(`${panelSel === 0 ? "❯" : " "} ● main`);
+		// Filled marker = the view you're in, hollow = the others (Claude Code).
+		lines.push(`${panelSel === 0 ? "❯" : " "} ${viewPane ? "◯" : "●"} main`);
 		rows.forEach((f, i) => {
 			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
 			const usage = formatUsage(f.usage);
 			const marker = panelSel === i + 1 ? "❯" : " ";
-			const prefix = `${marker} ${statusIcon(f.status)} ${f.name} · `;
+			const icon = f.id === viewedId ? "⏺" : statusIcon(f.status);
+			const prefix = `${marker} ${icon} ${f.name} · `;
 			const suffix = `${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
 			const activity =
 				f.status === "running" || f.status === "starting"
@@ -1000,7 +1007,6 @@ export default function (pi: ExtensionAPI) {
 	// ------------------------------------------------------------- dock UI
 
 	type DockResult = { type: "close" } | { type: "open"; forkId: number };
-	type ViewerResult = { type: "close" } | { type: "back" };
 
 	function dockRows(): Fork[] {
 		const all = [...forks.values()];
@@ -1122,38 +1128,32 @@ export default function (pi: ExtensionAPI) {
 		{ width: number; lines: string[] }
 	>();
 
-	class ForkViewerComponent {
-		private input = new Input();
+	/**
+	 * Full-width fork transcript pane, Claude Code style: it visually replaces
+	 * the main conversation while pi's real editor keeps focus below it (the
+	 * overlay is non-capturing). Input routing while it's open lives in
+	 * SubtaskEditor; this component only displays and tails the transcript.
+	 */
+	class ForkPane {
 		private disposed = false;
 		/** Wrapped-line offset from the END of the transcript; 0 = tailing. */
-		private scrollBack = 0;
+		scrollBack = 0;
 		private tui: TUI;
 		private theme: Theme;
-		private done: (result: ViewerResult) => void;
-		private fork: Fork;
+		fork: Fork;
 
-		constructor(
-			tui: TUI,
-			theme: Theme,
-			done: (result: ViewerResult) => void,
-			fork: Fork,
-		) {
+		constructor(tui: TUI, theme: Theme, fork: Fork) {
 			this.tui = tui;
 			this.theme = theme;
-			this.done = done;
 			this.fork = fork;
-			this.input.focused = true;
-			this.input.onSubmit = (value: string) => {
-				const text = value.trim();
-				if (!text) return;
-				sendToFork(this.fork, text);
-				this.input.setValue("");
-				this.scrollBack = 0;
-				this.tui.requestRender();
-			};
 			fork.onTranscriptUpdate = () => {
 				if (!this.disposed) this.tui.requestRender();
 			};
+		}
+
+		scrollBy(delta: number) {
+			this.scrollBack = Math.max(0, this.scrollBack + delta);
+			this.tui.requestRender();
 		}
 
 		private itemLines(item: TranscriptItem, width: number): string[] {
@@ -1198,35 +1198,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		handleInput(data: string): void {
-			if (matchesKey(data, "escape")) {
-				this.done({ type: "back" });
-				return;
-			}
-			if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u")) {
-				this.scrollBack += 10;
-				this.tui.requestRender();
-				return;
-			}
-			if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d")) {
-				this.scrollBack = Math.max(0, this.scrollBack - 10);
-				this.tui.requestRender();
-				return;
-			}
-			this.input.handleInput(data);
-			this.tui.requestRender();
-		}
-
 		render(width: number): string[] {
 			const t = this.theme;
 			const fork = this.fork;
 			const contentWidth = Math.max(20, width - 2);
-
-			const header = clipLine(
-				`${statusIcon(fork.status)} ${fork.name} · ${fork.status}${formatUsage(fork.usage) ? ` · ${formatUsage(fork.usage)}` : ""}`,
-				contentWidth,
-			);
-			const dismissed = !forks.has(fork.id);
 
 			// Flatten the transcript into wrapped lines.
 			const body: string[] = [];
@@ -1235,14 +1210,12 @@ export default function (pi: ExtensionAPI) {
 				if (item.type === "assistant") body.push("");
 			}
 
+			// The pane covers everything above the editor + widget + footer.
 			// Manual tail windowing: overlays get no viewport from the TUI and
 			// maxHeight truncates from the top, so slice the tail ourselves.
 			const rows = this.tui.terminal.rows;
-			const chrome = 6; // header + separators + input + hint + borders
-			const visibleCount = Math.max(
-				3,
-				Math.min(rows - chrome - 2, body.length),
-			);
+			const bottomChrome = 8 + widgetRows().length; // editor+footer+widget+hints
+			const visibleCount = Math.max(3, rows - bottomChrome - 2);
 			this.scrollBack = Math.max(
 				0,
 				Math.min(this.scrollBack, Math.max(0, body.length - visibleCount)),
@@ -1251,34 +1224,37 @@ export default function (pi: ExtensionAPI) {
 			const visible = body.slice(Math.max(0, end - visibleCount), end);
 
 			const lines: string[] = [];
+			const header = clipLine(
+				`${statusIcon(fork.status)} ${fork.name}${formatUsage(fork.usage) ? ` · ${formatUsage(fork.usage)}` : ""} · esc to return to main`,
+				contentWidth,
+			);
 			lines.push(t.fg("toolTitle", t.bold(` ${header}`)));
-			if (dismissed)
+			if (!forks.has(fork.id))
 				lines.push(t.fg("warning", " (fork dismissed — esc to close)"));
-			if (this.scrollBack > 0 || end - visibleCount > 0) {
+			if (end - visibleCount > 0) {
 				lines.push(
-					t.fg("dim", ` ↑ ${Math.max(0, end - visibleCount)} more line(s)`),
+					t.fg(
+						"dim",
+						` ↑ ${Math.max(0, end - visibleCount)} more line(s) (pageUp)`,
+					),
 				);
 			} else {
-				lines.push(t.fg("dim", " ─".repeat(Math.floor(contentWidth / 2))));
+				lines.push("");
 			}
 			for (const line of visible) lines.push(` ${line}`);
 			if (this.scrollBack > 0)
 				lines.push(
 					t.fg("dim", ` ↓ ${this.scrollBack} more line(s) (pageDown)`),
 				);
-			lines.push(t.fg("dim", " ─".repeat(Math.floor(contentWidth / 2))));
-			for (const line of this.input.render(contentWidth))
-				lines.push(` ${line}`);
-			lines.push(
-				t.fg("dim", " enter send · pageUp/pageDown scroll · esc back"),
-			);
+			// Pad so the pane fully covers the main transcript behind it.
+			while (lines.length < visibleCount + 3) lines.push("");
 			return lines;
 		}
 
 		invalidate(): void {}
 
 		dispose(): void {
-			// Viewer is a window onto the fork, never its owner: detach only.
+			// The pane is a window onto the fork, never its owner: detach only.
 			this.disposed = true;
 			if (this.fork.onTranscriptUpdate)
 				this.fork.onTranscriptUpdate = undefined;
@@ -1299,41 +1275,60 @@ export default function (pi: ExtensionAPI) {
 		if (uiOpen) return;
 		uiOpen = true;
 		try {
-			while (true) {
-				const action = await ctx.ui.custom<DockResult>(
-					(tui, theme, _kb, done) => new ForkDockComponent(tui, theme, done),
-					{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
-				);
-				if (!action || action.type === "close") return;
-				const fork = forks.get(action.forkId);
-				if (!fork) continue;
-				const viewed = await ctx.ui.custom<ViewerResult>(
-					(tui, theme, _kb, done) =>
-						new ForkViewerComponent(tui, theme, done, fork),
-					{ overlay: true, overlayOptions: { width: "95%", anchor: "center" } },
-				);
-				if (!viewed || viewed.type === "close") return;
-				// "back" → loop, dock reopens
-			}
+			const action = await ctx.ui.custom<DockResult>(
+				(tui, theme, _kb, done) => new ForkDockComponent(tui, theme, done),
+				{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
+			);
+			if (!action || action.type === "close") return;
+			const fork = forks.get(action.forkId);
+			if (fork) enterForkView(fork);
 		} finally {
 			uiOpen = false;
 		}
 	}
 
-	/** Open the live transcript viewer for one fork (no dock round-trip). */
-	async function openViewerFor(fork: Fork): Promise<void> {
+	/**
+	 * Fork view state: while set, the fork's transcript pane covers the main
+	 * conversation (non-capturing overlay) and SubtaskEditor routes typed
+	 * messages to the fork — Claude Code's transcript-replacement UX.
+	 */
+	let viewPane: ForkPane | undefined;
+	let viewDone: (() => void) | undefined;
+
+	function enterForkView(fork: Fork) {
 		const ctx = lastCtx;
-		if (!ctx || ctx.mode !== "tui" || !ctx.hasUI || uiOpen) return;
-		uiOpen = true;
-		try {
-			await ctx.ui.custom<ViewerResult>(
-				(tui, theme, _kb, done) =>
-					new ForkViewerComponent(tui, theme, done, fork),
-				{ overlay: true, overlayOptions: { width: "95%", anchor: "center" } },
-			);
-		} finally {
-			uiOpen = false;
-		}
+		if (!ctx || ctx.mode !== "tui" || !ctx.hasUI || viewPane) return;
+		void (async () => {
+			try {
+				await ctx.ui.custom<undefined>(
+					(tui, theme, _kb, done) => {
+						const pane = new ForkPane(tui, theme, fork);
+						viewPane = pane;
+						viewDone = () => done(undefined);
+						return pane;
+					},
+					{
+						overlay: true,
+						overlayOptions: {
+							width: "100%",
+							anchor: "top-left",
+							margin: 0,
+							// Focus stays in pi's real editor; the pane only displays.
+							nonCapturing: true,
+						},
+					},
+				);
+			} finally {
+				viewPane = undefined;
+				viewDone = undefined;
+				renderWidget();
+			}
+		})();
+		renderWidget();
+	}
+
+	function exitForkView() {
+		viewDone?.();
 	}
 
 	function stopOrDismissFork(fork: Fork) {
@@ -1353,6 +1348,37 @@ export default function (pi: ExtensionAPI) {
 	 */
 	class SubtaskEditor extends CustomEditor {
 		handleInput(data: string): void {
+			// Fork view open: input routes to the fork, Claude Code style.
+			if (viewPane) {
+				if (matchesKey(data, "escape")) {
+					exitForkView();
+					return;
+				}
+				if (matchesKey(data, "pageUp")) {
+					viewPane.scrollBy(10);
+					return;
+				}
+				if (matchesKey(data, "pageDown")) {
+					viewPane.scrollBy(-10);
+					return;
+				}
+				if (matchesKey(data, "return")) {
+					const text = this.getText().trim();
+					if (!text) return;
+					if (text.startsWith("/")) {
+						// Built-in commands still act on the main session, like
+						// Claude Code's transcript view.
+						super.handleInput(data);
+						return;
+					}
+					this.setText("");
+					viewPane.scrollBack = 0;
+					sendToFork(viewPane.fork, text);
+					return;
+				}
+				super.handleInput(data);
+				return;
+			}
 			if (panelSel === null) {
 				if (
 					matchesKey(data, "down") &&
@@ -1377,7 +1403,7 @@ export default function (pi: ExtensionAPI) {
 				const fork = panelSel > 0 ? rows[panelSel - 1] : undefined;
 				panelSel = null;
 				renderWidget();
-				if (fork) void openViewerFor(fork);
+				if (fork) enterForkView(fork);
 				return;
 			} else if (data === "x" && panelSel > 0) {
 				const fork = rows[panelSel - 1];
@@ -1393,6 +1419,22 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			renderWidget();
+		}
+
+		render(width: number): string[] {
+			const lines = super.render(width);
+			// Label the input border with the viewed fork, like Claude Code's
+			// @agent-name marker, so it's clear where typed messages go.
+			if (viewPane && lines.length > 0) {
+				const label = ` @${forkName(viewPane.fork.name)} `;
+				if (visibleWidth(lines[0]) >= label.length + 4) {
+					lines[0] =
+						truncateToWidth(lines[0], width - label.length - 2, "") +
+						label +
+						"──";
+				}
+			}
+			return lines;
 		}
 	}
 
@@ -1659,6 +1701,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		exitForkView();
 		for (const fork of [...forks.values()]) {
 			const proc = fork.proc;
 			if (proc && proc.exitCode === null) {
