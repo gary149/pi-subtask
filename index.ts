@@ -540,7 +540,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const viewedId = viewPane?.fork.id;
 		const hint = viewPane
-			? `viewing @${viewPane.fork.name} — typing goes to the fork · esc back to main`
+			? `viewing @${viewPane.fork.name} — typing goes to the fork · ↓ switch · esc back to main`
 			: panelSel === null
 				? `subtasks (${rows.length}) — ↓ to select`
 				: "enter to view · x to stop/dismiss · esc back";
@@ -1112,6 +1112,18 @@ export default function (pi: ExtensionAPI) {
 			this.tui.requestRender();
 		}
 
+		/** Switch the pane to another fork without closing the overlay. */
+		setFork(fork: Fork) {
+			if (this.fork.onTranscriptUpdate)
+				this.fork.onTranscriptUpdate = undefined;
+			this.fork = fork;
+			this.scrollBack = 0;
+			fork.onTranscriptUpdate = () => {
+				if (!this.disposed) this.tui.requestRender();
+			};
+			this.tui.requestRender();
+		}
+
 		private itemLines(item: TranscriptItem, width: number): string[] {
 			const t = this.theme;
 			switch (item.type) {
@@ -1273,6 +1285,47 @@ export default function (pi: ExtensionAPI) {
 		handleInput(data: string): void {
 			// Fork view open: input routes to the fork, Claude Code style.
 			if (viewPane) {
+				// Arrow navigation still works: select another row and switch
+				// the view in place (main row exits to the main conversation).
+				if (panelSel !== null) {
+					const rows = panelRows();
+					if (matchesKey(data, "up")) {
+						panelSel = Math.max(0, panelSel - 1);
+					} else if (matchesKey(data, "down")) {
+						panelSel = Math.min(rows.length, panelSel + 1);
+					} else if (matchesKey(data, "return")) {
+						const target = panelSel > 0 ? rows[panelSel - 1] : undefined;
+						panelSel = null;
+						if (!target) exitForkView();
+						else if (target.id !== viewPane.fork.id) viewPane.setFork(target);
+					} else if (matchesKey(data, "escape")) {
+						panelSel = null;
+					} else if (data === "x" && panelSel > 0) {
+						const fork = rows[panelSel - 1];
+						if (fork) stopOrDismissFork(fork);
+						const remaining = panelRows().length;
+						if (panelSel > remaining)
+							panelSel = remaining > 0 ? remaining : null;
+					} else {
+						panelSel = null;
+						renderWidget();
+						super.handleInput(data);
+						return;
+					}
+					renderWidget();
+					return;
+				}
+				if (
+					matchesKey(data, "down") &&
+					this.getText() === "" &&
+					forks.size > 0
+				) {
+					const rows = panelRows();
+					const viewedIdx = rows.findIndex((f) => f.id === viewPane?.fork.id);
+					panelSel = viewedIdx >= 0 ? viewedIdx + 1 : 0;
+					renderWidget();
+					return;
+				}
 				if (matchesKey(data, "escape")) {
 					exitForkView();
 					return;
