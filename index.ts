@@ -372,7 +372,11 @@ function parentConfigArgs(): string[] {
 			forwarded.push(arg);
 			if (!arg.includes("=")) {
 				const next = argv[i + 1];
-				if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
+				if (
+					next !== undefined &&
+					!next.startsWith("-") &&
+					!next.startsWith("@")
+				) {
 					forwarded.push(next);
 					i++;
 				}
@@ -483,31 +487,72 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	/**
+	 * Width-aware widget rows: one line per fork, no wrapping. The activity
+	 * preview absorbs the trimming so usage and elapsed time always stay
+	 * visible, which is why this is a Component (render receives the width)
+	 * instead of a plain string[] that the TUI would wrap.
+	 */
+	function widgetLines(width: number): string[] {
+		const rows = widgetRows();
+		const lines = [
+			clipLine(
+				`subtasks (${rows.length}) — alt+t or /subtasks to manage`,
+				width,
+			),
+		];
+		for (const f of rows) {
+			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
+			const usage = formatUsage(f.usage);
+			const prefix = `${statusIcon(f.status)} ${f.name} · `;
+			const suffix = `${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
+			const activity =
+				f.status === "running" || f.status === "starting"
+					? f.activity || "..."
+					: f.status;
+			const room = Math.max(8, width - prefix.length - suffix.length);
+			lines.push(
+				clipLine(prefix, width - 1) + clipLine(activity, room) + suffix,
+			);
+		}
+		return lines;
+	}
+
+	let widgetTui: TUI | undefined;
+	let widgetVisible = false;
+
 	function renderWidget() {
 		dockRerender?.();
 		if (!lastCtx?.hasUI) return;
 		try {
 			const rows = widgetRows();
 			if (rows.length === 0) {
-				lastCtx.ui.setWidget("subtasks", undefined);
+				if (widgetVisible) {
+					lastCtx.ui.setWidget("subtasks", undefined);
+					widgetVisible = false;
+					widgetTui = undefined;
+				}
 				return;
 			}
-			const lines = rows.map((f) => {
-				const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
-				const usage = formatUsage(f.usage);
-				const activity =
-					f.status === "running" || f.status === "starting"
-						? f.activity
-						: f.status;
-				return `${statusIcon(f.status)} ${f.name} · ${activity}${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
-			});
-			lastCtx.ui.setWidget(
-				"subtasks",
-				[`subtasks (${rows.length}) — alt+t or /subtasks to manage`, ...lines],
-				{
-					placement: "belowEditor",
-				},
-			);
+			if (!widgetVisible) {
+				widgetVisible = true;
+				lastCtx.ui.setWidget(
+					"subtasks",
+					(tui, _theme) => {
+						widgetTui = tui;
+						return {
+							render: (width: number) => widgetLines(width),
+							invalidate: () => {},
+							dispose: () => {
+								if (widgetTui === tui) widgetTui = undefined;
+							},
+						};
+					},
+					{ placement: "belowEditor" },
+				);
+			} else {
+				widgetTui?.requestRender();
+			}
 		} catch {
 			// UI context can go stale across session replacement; drop the update.
 		}
@@ -652,7 +697,12 @@ export default function (pi: ExtensionAPI) {
 		].join("\n");
 	}
 
-	function spawnFork(fork: Fork, cwd: string, prompt: string, displayText?: string) {
+	function spawnFork(
+		fork: Fork,
+		cwd: string,
+		prompt: string,
+		displayText?: string,
+	) {
 		const invocation = getPiInvocation([
 			"--mode",
 			"rpc",
@@ -735,7 +785,11 @@ export default function (pi: ExtensionAPI) {
 						| undefined;
 					// isError lives on the event itself; the result's own flag is a
 					// fallback for older wire formats.
-					const ok = !((event.isError as boolean | undefined) ?? result?.isError ?? false);
+					const ok = !(
+						(event.isError as boolean | undefined) ??
+						result?.isError ??
+						false
+					);
 					let summary = "";
 					if (Array.isArray(result?.content)) {
 						const text = result.content.find(
@@ -1318,13 +1372,8 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				lastCtx = ctx as unknown as ExtensionContext;
-				const result = startFork(
-					ctx as unknown as ExtensionContext,
-					params.task,
-					true,
-					params.cwd,
-				);
+				lastCtx = ctx;
+				const result = startFork(ctx, params.task, true, params.cwd);
 				if (typeof result === "string") {
 					return {
 						content: [
@@ -1499,6 +1548,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		lastCtx = ctx;
+		// New session, new UI: the widget must re-register itself.
+		widgetVisible = false;
+		widgetTui = undefined;
 		renderWidget();
 	});
 
