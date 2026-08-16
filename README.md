@@ -9,8 +9,6 @@ Inspired by Claude Code's forked subagents (`/subtask`).
 ## Install
 
 ```bash
-pi install npm:pi-subtask
-# or straight from git
 pi install git:github.com/gary149/pi-subtask
 ```
 
