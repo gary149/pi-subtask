@@ -1,6 +1,6 @@
 {
 	"name": "pi-subtask",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"type": "module",
 	"description": "Fork the current conversation into a background subagent that reports back. /subtask for pi, inspired by Claude Code's forked subagents.",
 	"keywords": [

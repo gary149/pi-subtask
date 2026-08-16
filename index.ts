@@ -118,6 +118,9 @@ interface Fork {
 	parentLeafId: string | null;
 	/** Working directory the fork runs in (spawn and resume). */
 	cwd: string;
+	/** Model and thinking level pinned at spawn (survives empty snapshots). */
+	model?: string;
+	thinkingLevel?: string;
 	/** Ring buffer of transcript items feeding the live viewer. */
 	transcript: TranscriptItem[];
 	/** Set by an open viewer so new items trigger a repaint. */
@@ -292,6 +295,13 @@ const FORWARDED_VALUE_FLAGS = new Set([
 	"--prompt-template",
 	"--session-dir",
 ]);
+const PATH_VALUE_FLAGS = new Set([
+	"--extension",
+	"-e",
+	"--skill",
+	"--prompt-template",
+	"--session-dir",
+]);
 const FORWARDED_BOOL_FLAGS = new Set([
 	"--no-tools",
 	"-nt",
@@ -372,7 +382,10 @@ function parentConfigArgs(): string[] {
 		if (FORWARDED_BOOL_FLAGS.has(arg)) {
 			forwarded.push(arg);
 		} else if (FORWARDED_VALUE_FLAGS.has(arg) && i + 1 < argv.length) {
-			forwarded.push(arg, argv[++i]);
+			let value = argv[++i];
+			// Path-bearing values must survive the child running in another cwd.
+			if (PATH_VALUE_FLAGS.has(arg)) value = path.resolve(value);
+			forwarded.push(arg, value);
 		} else if (DROPPED_BUILTIN_FLAGS.has(arg)) {
 			if (DROPPED_VALUE_FLAGS.has(arg)) i++;
 		} else if (arg.startsWith("--")) {
@@ -403,7 +416,10 @@ function parentConfigArgs(): string[] {
  * model/thinking/compaction entries, minus label bookmarks), re-chains
  * parentIds, and records the parent session in the header.
  */
-function writeSnapshot(ctx: ExtensionContext): {
+function writeSnapshot(
+	ctx: ExtensionContext,
+	forkCwd: string,
+): {
 	file: string;
 	tempDir?: string;
 } {
@@ -432,6 +448,9 @@ function writeSnapshot(ctx: ExtensionContext): {
 			...header,
 			id,
 			timestamp,
+			// pi derives the child's runtime cwd from the header, not from the
+			// spawned process cwd.
+			cwd: forkCwd,
 			parentSession: parentSessionFile,
 		}),
 	];
@@ -744,6 +763,10 @@ export default function (pi: ExtensionAPI) {
 			"rpc",
 			"--session",
 			fork.sessionFile,
+			// Pin model/thinking explicitly: a snapshot with no messages yet is
+			// treated as a fresh session and would fall back to defaults.
+			...(fork.model ? ["--model", fork.model] : []),
+			...(fork.thinkingLevel ? ["--thinking", fork.thinkingLevel] : []),
 			...parentConfigArgs(),
 		]);
 		const proc = spawn(invocation.command, invocation.args, {
@@ -975,7 +998,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		let snapshot: { file: string; tempDir?: string };
 		try {
-			snapshot = writeSnapshot(ctx);
+			snapshot = writeSnapshot(ctx, cwd);
 		} catch (err) {
 			return `could not snapshot conversation: ${err instanceof Error ? err.message : err}`;
 		}
@@ -1000,6 +1023,8 @@ export default function (pi: ExtensionAPI) {
 			},
 			startedAt: Date.now(),
 			spawnedByModel,
+			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			thinkingLevel: ctx.thinkingLevel,
 			parentSessionId: ctx.sessionManager.getSessionId(),
 			parentLeafId: ctx.sessionManager.getLeafId(),
 			cwd,
