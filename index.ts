@@ -549,11 +549,23 @@ export default function (pi: ExtensionAPI) {
 		lines.push(`${panelSel === 0 ? "❯" : " "} ${viewPane ? "◯" : "●"} main`);
 		rows.forEach((f, i) => {
 			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
+			const viewed = f.id === viewedId;
+			const stats: string[] = [];
+			if (viewed && f.tps) stats.push(`${f.tps.toFixed(1)} tok/s`);
 			const usage = formatUsage(f.usage);
+			if (usage) stats.push(usage);
+			if (viewed && f.contextWindow && f.lastTotalTokens) {
+				const pct = (f.lastTotalTokens / f.contextWindow) * 100;
+				const window =
+					f.contextWindow >= 1_000_000
+						? `${(f.contextWindow / 1_000_000).toFixed(1)}M`
+						: formatTokens(f.contextWindow);
+				stats.push(`${pct.toFixed(1)}%/${window}`);
+			}
 			const marker = panelSel === i + 1 ? "❯" : " ";
-			const icon = f.id === viewedId ? "⏺" : statusIcon(f.status);
+			const icon = viewed ? "⏺" : statusIcon(f.status);
 			const prefix = `${marker} ${icon} ${f.name} · `;
-			const suffix = `${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
+			const suffix = `${stats.length ? ` · ${stats.join(" · ")}` : ""} · ${elapsed}s`;
 			const activity =
 				f.status === "running" || f.status === "starting"
 					? f.activity || "..."
@@ -572,28 +584,6 @@ export default function (pi: ExtensionAPI) {
 	function renderWidget() {
 		if (!lastCtx?.hasUI) return;
 		try {
-			// While a fork view is open, its identity/usage lives in pi's status
-			// bar (not in the pane itself, which would leak lines into the
-			// terminal scrollback on re-renders).
-			if (viewPane) {
-				const f = viewPane.fork;
-				const parts = [`⏺ @${f.name}`, f.status];
-				if (f.tps) parts.push(`${f.tps.toFixed(1)} tok/s`);
-				const usage = formatUsage(f.usage);
-				if (usage) parts.push(usage);
-				if (f.contextWindow && f.lastTotalTokens) {
-					const pct = (f.lastTotalTokens / f.contextWindow) * 100;
-					const window =
-						f.contextWindow >= 1_000_000
-							? `${(f.contextWindow / 1_000_000).toFixed(1)}M`
-							: formatTokens(f.contextWindow);
-					parts.push(`${pct.toFixed(1)}%/${window}`);
-				}
-				parts.push("esc to return to main");
-				lastCtx.ui.setStatus("subtask", parts.join(" · "));
-			} else {
-				lastCtx.ui.setStatus("subtask", undefined);
-			}
 			const visibleRows =
 				panelSel !== null || viewPane ? panelRows() : widgetRows();
 			if (visibleRows.length === 0) {
