@@ -21,10 +21,16 @@ pi install git:github.com/gary149/pi-subtask
 Running forks appear in a panel below the editor with live activity, token usage, and cost. When a fork finishes, its result lands in your conversation as a message and the model reacts to it.
 
 ```
-/subtasks
+/subtasks        (or Alt+T)
 ```
 
-Manage forks: steer a running fork, stop it, resume a finished one with a follow-up (it remembers both your conversation and its own work), show its output, or dismiss it.
+Opens the fork dock. `↑↓` select a fork, `x` stops a running one or dismisses a finished one, `Esc` closes, and `Enter` opens the **live transcript viewer**: watch the fork's tool calls and replies stream in as it works, scroll with `PageUp`/`PageDown`, and type a message + `Enter` to talk to it directly. While it runs your message steers it; after it finishes, your message resumes it in place (it remembers both your conversation and its own work).
+
+```
+/subtask-tool on
+```
+
+Lets the model delegate on its own: registers a `subtask` tool the model can call to fork the conversation in the background (max 4 concurrent). The tool returns immediately with a receipt and the result comes back as a notification in a later turn, so the model keeps working meanwhile. Off by default; `/subtask-tool off` disables it again.
 
 ## How it works
 

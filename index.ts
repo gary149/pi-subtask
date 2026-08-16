@@ -15,13 +15,21 @@
  * request can reuse the parent's provider-side prompt cache.
  *
  * Commands:
- *   /subtask <task>   Start a fork working on <task> in the background
- *   /subtasks         Manage forks: steer, follow up, stop, view output, dismiss
+ *   /subtask <task>       Start a fork working on <task> in the background
+ *   /subtasks (or Alt+T) Open the fork dock: watch live transcripts, steer,
+ *                         stop, resume, dismiss
+ *   /subtask-tool on|off  Let the model spawn forks itself via a `subtask`
+ *                         tool (off by default)
+ *
+ * Dock keys: up/down select, enter opens the live transcript viewer, x stops a
+ * running fork or dismisses a finished one, esc closes. Inside the viewer,
+ * type + enter sends a message to the fork (steers it while running, resumes
+ * it when finished), pageUp/pageDown scroll, esc goes back.
  *
  * Notes:
  * - Running forks appear in a panel below the editor.
  * - A fork's transcript is a normal session file: resume it any time with
- *   `pi --session <file>`. Follow-ups from /subtasks respawn it in place.
+ *   `pi --session <file>`. Follow-ups respawn it in place.
  *   With --no-session parents, snapshots go to a temp dir and are cleaned up.
  * - Config flags from the parent invocation (tool restrictions, -e extensions,
  *   system-prompt additions, trust overrides) are forwarded to the child.
@@ -36,15 +44,30 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import { uuidv7 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionContext,
+	Theme,
+} from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import type { TUI } from "@earendil-works/pi-tui";
+import {
+	Container,
+	Input,
+	Markdown,
+	matchesKey,
+	Spacer,
+	Text,
+} from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 
 const DONE_ROW_LINGER_MS = 5_000;
 const FAILED_ROW_LINGER_MS = 30_000;
 const MAX_RETAINED_FINISHED = 20;
 const RESULT_CAP_BYTES = 50 * 1024;
 const KILL_GRACE_MS = 3_000;
+const MAX_TRANSCRIPT_ITEMS = 500;
+const MAX_MODEL_FORKS = 4;
 
 interface ForkUsage {
 	turns: number;
@@ -54,6 +77,19 @@ interface ForkUsage {
 	cacheWrite: number;
 	cost: number;
 }
+
+type TranscriptItem =
+	| { type: "user"; text: string; ts: number }
+	| { type: "assistant"; text: string; ts: number }
+	| { type: "tool"; name: string; args: Record<string, unknown>; ts: number }
+	| {
+			type: "tool_result";
+			name: string;
+			ok: boolean;
+			summary: string;
+			ts: number;
+	  }
+	| { type: "system"; text: string; ts: number };
 
 interface Fork {
 	id: number;
@@ -67,6 +103,14 @@ interface Fork {
 	errorText: string;
 	usage: ForkUsage;
 	startedAt: number;
+	/** True when the fork was spawned by the model via the subtask tool. */
+	spawnedByModel: boolean;
+	/** Parent session id at spawn time; delivery is skipped if it changed. */
+	parentSessionId: string;
+	/** Ring buffer of transcript items feeding the live viewer. */
+	transcript: TranscriptItem[];
+	/** Set by an open viewer so new items trigger a repaint. */
+	onTranscriptUpdate?: () => void;
 	/** Set when the child accepted our prompt command. */
 	promptAccepted: boolean;
 	/** Set when the child's agent loop actually started. */
@@ -87,6 +131,7 @@ interface SubtaskResultDetails {
 	sessionFile: string;
 	usage: ForkUsage;
 	elapsedMs: number;
+	resultText: string;
 }
 
 function forkName(task: string): string {
@@ -102,7 +147,8 @@ function formatTokens(count: number): string {
 
 function formatUsage(usage: ForkUsage): string {
 	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+	if (usage.turns)
+		parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
 	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
 	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
 	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
@@ -124,7 +170,10 @@ function statusIcon(status: Fork["status"]): string {
 	}
 }
 
-function formatActivity(toolName: string, args: Record<string, unknown>): string {
+function formatActivity(
+	toolName: string,
+	args: Record<string, unknown>,
+): string {
 	switch (toolName) {
 		case "bash":
 			return `$ ${String(args.command ?? "").slice(0, 50)}`;
@@ -141,6 +190,29 @@ function formatActivity(toolName: string, args: Record<string, unknown>): string
 	}
 }
 
+function formatToolLine(
+	toolName: string,
+	args: Record<string, unknown>,
+): string {
+	switch (toolName) {
+		case "bash":
+			return `$ ${String(args.command ?? "")}`;
+		case "read":
+		case "write":
+		case "edit":
+		case "ls":
+			return `${toolName} ${String(args.file_path ?? args.path ?? "")}`;
+		case "grep":
+			return `grep /${String(args.pattern ?? "")}/ in ${String(args.path ?? ".")}`;
+		case "find":
+			return `find ${String(args.pattern ?? "*")} in ${String(args.path ?? ".")}`;
+		default: {
+			const preview = JSON.stringify(args ?? {});
+			return `${toolName} ${preview.length > 80 ? `${preview.slice(0, 80)}...` : preview}`;
+		}
+	}
+}
+
 function lastAssistantText(msg: Message): string {
 	if (msg.role !== "assistant") return "";
 	return msg.content
@@ -152,8 +224,15 @@ function lastAssistantText(msg: Message): string {
 function capResult(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= RESULT_CAP_BYTES) return text;
 	let truncated = text.slice(0, RESULT_CAP_BYTES);
-	while (Buffer.byteLength(truncated, "utf8") > RESULT_CAP_BYTES) truncated = truncated.slice(0, -1);
+	while (Buffer.byteLength(truncated, "utf8") > RESULT_CAP_BYTES)
+		truncated = truncated.slice(0, -1);
 	return `${truncated}\n\n[Truncated. Full transcript in the fork's session file.]`;
+}
+
+/** Truncate a plain (unstyled) string to a display width, ASCII-safe. */
+function clipLine(text: string, width: number): string {
+	if (text.length <= width) return text;
+	return `${text.slice(0, Math.max(0, width - 1))}…`;
 }
 
 /**
@@ -165,7 +244,10 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
 		// Keep execArgv so loader flags (e.g. tsx via ./pi-test.sh) survive the respawn.
-		return { command: process.execPath, args: [...process.execArgv, currentScript, ...args] };
+		return {
+			command: process.execPath,
+			args: [...process.execArgv, currentScript, ...args],
+		};
 	}
 	const execName = path.basename(process.execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
@@ -236,7 +318,10 @@ function parentConfigArgs(): string[] {
  * model/thinking/compaction entries, minus label bookmarks), re-chains
  * parentIds, and records the parent session in the header.
  */
-function writeSnapshot(ctx: ExtensionContext): { file: string; tempDir?: string } {
+function writeSnapshot(ctx: ExtensionContext): {
+	file: string;
+	tempDir?: string;
+} {
 	const header = ctx.sessionManager.getHeader();
 	const branch = ctx.sessionManager.getBranch();
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
@@ -245,23 +330,51 @@ function writeSnapshot(ctx: ExtensionContext): { file: string; tempDir?: string 
 	// An ephemeral parent (--no-session) has no session dir; keep its fork
 	// snapshots out of the project and off the normal session list.
 	const ephemeral = !parentSessionFile || !rawSessionDir;
-	const sessionDir = ephemeral ? fs.mkdtempSync(path.join(os.tmpdir(), "pi-subtask-")) : path.resolve(rawSessionDir);
+	const sessionDir = ephemeral
+		? fs.mkdtempSync(path.join(os.tmpdir(), "pi-subtask-"))
+		: path.resolve(rawSessionDir);
 	if (!ephemeral) fs.mkdirSync(sessionDir, { recursive: true });
 
 	const id = uuidv7();
 	const timestamp = new Date().toISOString();
-	const file = path.join(sessionDir, `${timestamp.replace(/[:.]/g, "-")}_${id}.jsonl`);
+	const file = path.join(
+		sessionDir,
+		`${timestamp.replace(/[:.]/g, "-")}_${id}.jsonl`,
+	);
 
-	const lines: string[] = [JSON.stringify({ ...header, id, timestamp, parentSession: parentSessionFile })];
+	const lines: string[] = [
+		JSON.stringify({
+			...header,
+			id,
+			timestamp,
+			parentSession: parentSessionFile,
+		}),
+	];
 	let parentId: string | null = null;
 	for (const entry of branch) {
 		if (entry.type === "label") continue;
 		lines.push(JSON.stringify({ ...entry, parentId }));
 		parentId = entry.id;
 	}
-	fs.writeFileSync(file, `${lines.join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
+	fs.writeFileSync(file, `${lines.join("\n")}\n`, {
+		encoding: "utf-8",
+		mode: 0o600,
+	});
 	return { file, tempDir: ephemeral ? sessionDir : undefined };
 }
+
+const SubtaskToolParams = Type.Object({
+	task: Type.String({
+		description:
+			"The task for the fork to work on. Include goal, scope, whether edits are allowed, and the output format you want.",
+	}),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Working directory for the fork. Defaults to the session's cwd.",
+		}),
+	),
+});
 
 export default function (pi: ExtensionAPI) {
 	// A fork can't spawn further forks.
@@ -270,6 +383,22 @@ export default function (pi: ExtensionAPI) {
 	const forks = new Map<number, Fork>();
 	let nextId = 1;
 	let lastCtx: ExtensionContext | undefined;
+	/** Set while the dock overlay is open so state changes repaint it. */
+	let dockRerender: (() => void) | undefined;
+	/** Reentrancy guard for the dock/viewer UI (Alt+T while already open). */
+	let uiOpen = false;
+	let subtaskToolRegistered = false;
+	let subtaskToolOn = false;
+
+	// ------------------------------------------------------------ transcript
+
+	function pushTranscriptItem(fork: Fork, item: TranscriptItem) {
+		fork.transcript.push(item);
+		if (fork.transcript.length > MAX_TRANSCRIPT_ITEMS) {
+			fork.transcript.splice(0, fork.transcript.length - MAX_TRANSCRIPT_ITEMS);
+		}
+		fork.onTranscriptUpdate?.();
+	}
 
 	// ---------------------------------------------------------------- widget
 
@@ -277,12 +406,14 @@ export default function (pi: ExtensionAPI) {
 		// Finished rows age out of the widget but stay available in /subtasks.
 		return [...forks.values()].filter((f) => {
 			if (!f.finishedAt) return true;
-			const linger = f.status === "done" ? DONE_ROW_LINGER_MS : FAILED_ROW_LINGER_MS;
+			const linger =
+				f.status === "done" ? DONE_ROW_LINGER_MS : FAILED_ROW_LINGER_MS;
 			return Date.now() - f.finishedAt < linger;
 		});
 	}
 
 	function renderWidget() {
+		dockRerender?.();
 		if (!lastCtx?.hasUI) return;
 		try {
 			const rows = widgetRows();
@@ -293,12 +424,19 @@ export default function (pi: ExtensionAPI) {
 			const lines = rows.map((f) => {
 				const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
 				const usage = formatUsage(f.usage);
-				const activity = f.status === "running" || f.status === "starting" ? f.activity : f.status;
+				const activity =
+					f.status === "running" || f.status === "starting"
+						? f.activity
+						: f.status;
 				return `${statusIcon(f.status)} ${f.name} · ${activity}${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
 			});
-			lastCtx.ui.setWidget("subtasks", [`subtasks (${rows.length}) — /subtasks to manage`, ...lines], {
-				placement: "belowEditor",
-			});
+			lastCtx.ui.setWidget(
+				"subtasks",
+				[`subtasks (${rows.length}) — alt+t or /subtasks to manage`, ...lines],
+				{
+					placement: "belowEditor",
+				},
+			);
 		} catch {
 			// UI context can go stale across session replacement; drop the update.
 		}
@@ -318,7 +456,9 @@ export default function (pi: ExtensionAPI) {
 
 	/** Keep finished forks resumable, but bound how many we retain. */
 	function trimRetainedForks() {
-		const finished = [...forks.values()].filter((f) => f.finishedAt).sort((a, b) => a.finishedAt! - b.finishedAt!);
+		const finished = [...forks.values()]
+			.filter((f) => f.finishedAt)
+			.sort((a, b) => a.finishedAt! - b.finishedAt!);
 		while (finished.length > MAX_RETAINED_FINISHED) {
 			removeFork(finished.shift()!);
 		}
@@ -326,8 +466,18 @@ export default function (pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------- lifecycle
 
+	function runningModelForks(): number {
+		return [...forks.values()].filter(
+			(f) => f.spawnedByModel && !f.completed && f.proc !== null,
+		).length;
+	}
+
 	function deliverResult(fork: Fork) {
 		const elapsedMs = Date.now() - fork.startedAt;
+		const body =
+			fork.status === "done"
+				? capResult(fork.finalText || "(no output)")
+				: `The fork ${fork.status === "stopped" ? "was stopped" : "failed"}.${fork.errorText ? `\n\nError:\n${capResult(fork.errorText)}` : ""}${fork.finalText ? `\n\nPartial output:\n${capResult(fork.finalText)}` : ""}`;
 		const details: SubtaskResultDetails = {
 			name: fork.name,
 			task: fork.task,
@@ -335,20 +485,28 @@ export default function (pi: ExtensionAPI) {
 			sessionFile: fork.sessionFile,
 			usage: fork.usage,
 			elapsedMs,
+			resultText: body,
 		};
-		const body =
-			fork.status === "done"
-				? capResult(fork.finalText || "(no output)")
-				: `The fork ${fork.status === "stopped" ? "was stopped" : "failed"}.${fork.errorText ? `\n\nError:\n${capResult(fork.errorText)}` : ""}${fork.finalText ? `\n\nPartial output:\n${capResult(fork.finalText)}` : ""}`;
 		try {
+			// Skip delivery if the parent session was replaced since the fork
+			// spawned; the result stays recoverable in the fork's session file.
+			if (
+				lastCtx &&
+				lastCtx.sessionManager.getSessionId() !== fork.parentSessionId
+			) {
+				console.error(
+					`subtask: parent session changed; not delivering result of "${fork.name}"`,
+				);
+				return;
+			}
 			pi.sendMessage(
 				{
 					customType: "subtask-result",
-					content: `A background subtask forked from this conversation has finished.\n\nTask: ${fork.task}\nStatus: ${fork.status}\n\nResult:\n${body}`,
+					content: `A background subtask forked from this conversation has finished. This is an automated notification, not a message typed by the user.\n\n<subtask-result name="${fork.name}" status="${fork.status}">\nTask: ${fork.task}\n\n${body}\n</subtask-result>`,
 					display: true,
 					details,
 				},
-				{ triggerTurn: true },
+				{ deliverAs: "followUp", triggerTurn: true },
 			);
 		} catch (err) {
 			console.error("subtask: failed to deliver result:", err);
@@ -372,19 +530,31 @@ export default function (pi: ExtensionAPI) {
 			}, KILL_GRACE_MS);
 			proc.kill("SIGTERM");
 		}
+		pushTranscriptItem(fork, {
+			type: "system",
+			text: `── ${status} ──`,
+			ts: Date.now(),
+		});
 		if (status !== "stopped") deliverResult(fork);
 		// The fork stays in the map (resumable via /subtasks) but its widget row
 		// ages out; schedule a refresh so the row disappears without new events.
 		fork.finishedAt = Date.now();
 		trimRetainedForks();
 		if (fork.lingerTimer) clearTimeout(fork.lingerTimer);
-		const linger = status === "done" ? DONE_ROW_LINGER_MS : FAILED_ROW_LINGER_MS;
+		const linger =
+			status === "done" ? DONE_ROW_LINGER_MS : FAILED_ROW_LINGER_MS;
 		fork.lingerTimer = setTimeout(renderWidget, linger + 100);
 		renderWidget();
 	}
 
 	function spawnFork(fork: Fork, cwd: string, prompt: string) {
-		const invocation = getPiInvocation(["--mode", "rpc", "--session", fork.sessionFile, ...parentConfigArgs()]);
+		const invocation = getPiInvocation([
+			"--mode",
+			"rpc",
+			"--session",
+			fork.sessionFile,
+			...parentConfigArgs(),
+		]);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			shell: false,
@@ -403,6 +573,7 @@ export default function (pi: ExtensionAPI) {
 		let buffer = "";
 		proc.stdout.setEncoding("utf-8");
 		proc.stderr.setEncoding("utf-8");
+		pushTranscriptItem(fork, { type: "user", text: prompt, ts: Date.now() });
 
 		const handleEvent = (event: Record<string, unknown>) => {
 			switch (event.type) {
@@ -422,12 +593,43 @@ export default function (pi: ExtensionAPI) {
 					fork.agentStarted = true;
 					fork.status = "running";
 					break;
-				case "tool_execution_start":
-					fork.activity = formatActivity(
-						String(event.toolName ?? "tool"),
-						(event.args as Record<string, unknown>) ?? {},
-					);
+				case "tool_execution_start": {
+					const name = String(event.toolName ?? "tool");
+					const args = (event.args as Record<string, unknown>) ?? {};
+					fork.activity = formatActivity(name, args);
+					pushTranscriptItem(fork, {
+						type: "tool",
+						name,
+						args,
+						ts: Date.now(),
+					});
 					break;
+				}
+				case "tool_execution_end": {
+					const name = String(event.toolName ?? "tool");
+					const result = event.result as
+						| { isError?: boolean; content?: unknown }
+						| undefined;
+					const ok = !result?.isError;
+					let summary = "";
+					if (Array.isArray(result?.content)) {
+						const text = result.content.find(
+							(c): c is { type: "text"; text: string } =>
+								typeof c === "object" &&
+								c !== null &&
+								(c as { type?: string }).type === "text",
+						);
+						summary = (text?.text ?? "").split("\n")[0].slice(0, 80);
+					}
+					pushTranscriptItem(fork, {
+						type: "tool_result",
+						name,
+						ok,
+						summary,
+						ts: Date.now(),
+					});
+					break;
+				}
 				case "message_end": {
 					const msg = event.message as Message | undefined;
 					if (msg?.role === "assistant") {
@@ -444,9 +646,15 @@ export default function (pi: ExtensionAPI) {
 						if (text) {
 							fork.finalText = text;
 							fork.activity = text.split("\n")[0].slice(0, 50);
+							pushTranscriptItem(fork, {
+								type: "assistant",
+								text,
+								ts: Date.now(),
+							});
 						}
 						// A later successful message clears the error from a retried turn.
-						if (msg.stopReason === "error") fork.errorText = msg.errorMessage ?? "LLM error";
+						if (msg.stopReason === "error")
+							fork.errorText = msg.errorMessage ?? "LLM error";
 						else fork.errorText = "";
 					}
 					break;
@@ -461,7 +669,12 @@ export default function (pi: ExtensionAPI) {
 					// A child extension asked for user input; the fork is headless, so
 					// cancel the dialog instead of letting the child block forever.
 					const method = event.method;
-					if (method === "select" || method === "confirm" || method === "input" || method === "editor") {
+					if (
+						method === "select" ||
+						method === "confirm" ||
+						method === "input" ||
+						method === "editor"
+					) {
 						proc.stdin?.write(
 							`${JSON.stringify({ type: "extension_ui_response", id: event.id, cancelled: true })}\n`,
 						);
@@ -490,8 +703,16 @@ export default function (pi: ExtensionAPI) {
 		});
 		proc.on("close", (code) => {
 			if (!fork.completed) {
-				if (code !== 0 && !fork.errorText) fork.errorText = stderr.trim() || `pi exited with code ${code}`;
-				completeFork(fork, fork.status === "stopped" ? "stopped" : code === 0 ? "done" : "failed");
+				if (code !== 0 && !fork.errorText)
+					fork.errorText = stderr.trim() || `pi exited with code ${code}`;
+				completeFork(
+					fork,
+					fork.status === "stopped"
+						? "stopped"
+						: code === 0
+							? "done"
+							: "failed",
+				);
 			}
 		});
 		proc.on("error", (err) => {
@@ -501,26 +722,407 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 
-		proc.stdin.write(`${JSON.stringify({ type: "prompt", message: prompt })}\n`);
+		proc.stdin.write(
+			`${JSON.stringify({ type: "prompt", message: prompt })}\n`,
+		);
 	}
 
 	function sendToFork(fork: Fork, message: string, cwd: string) {
 		if (fork.proc && !fork.completed) {
 			// Running: queue as steering input on the live child.
-			fork.proc.stdin?.write(`${JSON.stringify({ type: "prompt", message, streamingBehavior: "steer" })}\n`);
+			pushTranscriptItem(fork, { type: "user", text: message, ts: Date.now() });
+			fork.proc.stdin?.write(
+				`${JSON.stringify({ type: "prompt", message, streamingBehavior: "steer" })}\n`,
+			);
 			return;
 		}
 		// Finished: resume the fork's session file with a fresh process.
 		if (fork.lingerTimer) clearTimeout(fork.lingerTimer);
 		fork.usage.turns = 0;
+		pushTranscriptItem(fork, {
+			type: "system",
+			text: "── resumed ──",
+			ts: Date.now(),
+		});
 		spawnFork(fork, cwd, message);
 		renderWidget();
+	}
+
+	function startFork(
+		ctx: ExtensionContext,
+		task: string,
+		spawnedByModel: boolean,
+	): Fork | string {
+		let snapshot: { file: string; tempDir?: string };
+		try {
+			snapshot = writeSnapshot(ctx);
+		} catch (err) {
+			return `could not snapshot conversation: ${err instanceof Error ? err.message : err}`;
+		}
+		const fork: Fork = {
+			id: nextId++,
+			name: forkName(task),
+			task,
+			sessionFile: snapshot.file,
+			tempDir: snapshot.tempDir,
+			proc: null,
+			status: "starting",
+			activity: "",
+			finalText: "",
+			errorText: "",
+			usage: {
+				turns: 0,
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				cost: 0,
+			},
+			startedAt: Date.now(),
+			spawnedByModel,
+			parentSessionId: ctx.sessionManager.getSessionId(),
+			transcript: [],
+			promptAccepted: false,
+			agentStarted: false,
+			completed: false,
+		};
+		forks.set(fork.id, fork);
+		spawnFork(fork, ctx.cwd, task);
+		renderWidget();
+		return fork;
+	}
+
+	// ------------------------------------------------------------- dock UI
+
+	type DockResult = { type: "close" } | { type: "open"; forkId: number };
+	type ViewerResult = { type: "close" } | { type: "back" };
+
+	function dockRows(): Fork[] {
+		const all = [...forks.values()];
+		const running = all.filter((f) => !f.finishedAt);
+		const finished = all
+			.filter((f) => f.finishedAt)
+			.sort((a, b) => b.finishedAt! - a.finishedAt!);
+		return [...running, ...finished];
+	}
+
+	class ForkDockComponent {
+		private selected = 0;
+		private disposed = false;
+		private tui: TUI;
+		private theme: Theme;
+		private done: (result: DockResult) => void;
+
+		constructor(tui: TUI, theme: Theme, done: (result: DockResult) => void) {
+			this.tui = tui;
+			this.theme = theme;
+			this.done = done;
+			dockRerender = () => {
+				if (!this.disposed) this.tui.requestRender();
+			};
+		}
+
+		handleInput(data: string): void {
+			const rows = dockRows();
+			if (matchesKey(data, "escape")) {
+				this.done({ type: "close" });
+				return;
+			}
+			if (matchesKey(data, "up")) {
+				this.selected = Math.max(0, this.selected - 1);
+				this.tui.requestRender();
+				return;
+			}
+			if (matchesKey(data, "down")) {
+				this.selected = Math.min(
+					Math.max(0, rows.length - 1),
+					this.selected + 1,
+				);
+				this.tui.requestRender();
+				return;
+			}
+			if (matchesKey(data, "return") && rows.length > 0) {
+				const fork = rows[Math.min(this.selected, rows.length - 1)];
+				this.done({ type: "open", forkId: fork.id });
+				return;
+			}
+			if (data === "x" && rows.length > 0) {
+				const fork = rows[Math.min(this.selected, rows.length - 1)];
+				if (fork.proc && !fork.completed) {
+					fork.proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
+					completeFork(fork, "stopped");
+				} else {
+					removeFork(fork);
+					this.selected = Math.max(
+						0,
+						Math.min(this.selected, dockRows().length - 1),
+					);
+					renderWidget();
+				}
+				this.tui.requestRender();
+			}
+		}
+
+		render(width: number): string[] {
+			const t = this.theme;
+			const rows = dockRows();
+			const lines: string[] = [];
+			lines.push(t.fg("toolTitle", t.bold(" subtasks")));
+			if (rows.length === 0) {
+				lines.push(
+					t.fg("muted", " no subtasks — start one with /subtask <task>"),
+				);
+			}
+			this.selected = Math.max(
+				0,
+				Math.min(this.selected, Math.max(0, rows.length - 1)),
+			);
+			rows.forEach((f, i) => {
+				const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
+				const usage = formatUsage(f.usage);
+				const activity =
+					f.status === "running" || f.status === "starting"
+						? f.activity
+						: f.status;
+				const text = clipLine(
+					`${statusIcon(f.status)} [${f.id}] ${f.name} · ${activity}${usage ? ` · ${usage}` : ""} · ${elapsed}s`,
+					width - 4,
+				);
+				lines.push(
+					i === this.selected ? t.fg("accent", `▸ ${text}`) : `  ${text}`,
+				);
+			});
+			lines.push("");
+			lines.push(
+				t.fg(
+					"dim",
+					" ↑↓ select · enter open transcript · x stop/dismiss · esc close",
+				),
+			);
+			return lines;
+		}
+
+		invalidate(): void {}
+
+		dispose(): void {
+			this.disposed = true;
+			dockRerender = undefined;
+		}
+	}
+
+	// ------------------------------------------------------------ viewer UI
+
+	const mdCache = new WeakMap<
+		TranscriptItem,
+		{ width: number; lines: string[] }
+	>();
+
+	class ForkViewerComponent {
+		private input = new Input();
+		private disposed = false;
+		/** Wrapped-line offset from the END of the transcript; 0 = tailing. */
+		private scrollBack = 0;
+		private tui: TUI;
+		private theme: Theme;
+		private done: (result: ViewerResult) => void;
+		private fork: Fork;
+		private cwd: string;
+
+		constructor(
+			tui: TUI,
+			theme: Theme,
+			done: (result: ViewerResult) => void,
+			fork: Fork,
+			cwd: string,
+		) {
+			this.tui = tui;
+			this.theme = theme;
+			this.done = done;
+			this.fork = fork;
+			this.cwd = cwd;
+			this.input.focused = true;
+			this.input.onSubmit = (value: string) => {
+				const text = value.trim();
+				if (!text) return;
+				sendToFork(this.fork, text, this.cwd);
+				this.input.setValue("");
+				this.scrollBack = 0;
+				this.tui.requestRender();
+			};
+			fork.onTranscriptUpdate = () => {
+				if (!this.disposed) this.tui.requestRender();
+			};
+		}
+
+		private itemLines(item: TranscriptItem, width: number): string[] {
+			const t = this.theme;
+			switch (item.type) {
+				case "user":
+					return [
+						t.fg(
+							"accent",
+							`› ${clipLine(item.text.replace(/\n/g, " "), width - 2)}`,
+						),
+					];
+				case "assistant": {
+					const cached = mdCache.get(item);
+					if (cached && cached.width === width) return cached.lines;
+					const lines = new Markdown(
+						item.text.trim(),
+						0,
+						0,
+						getMarkdownTheme(),
+					).render(width);
+					mdCache.set(item, { width, lines });
+					return lines;
+				}
+				case "tool":
+					return [
+						t.fg(
+							"muted",
+							`→ ${clipLine(formatToolLine(item.name, item.args), width - 2)}`,
+						),
+					];
+				case "tool_result": {
+					const icon = item.ok ? "✔" : "✘";
+					const text = clipLine(
+						`${icon} ${item.summary || item.name}`,
+						width - 2,
+					);
+					return [t.fg(item.ok ? "dim" : "error", `  ${text}`)];
+				}
+				case "system":
+					return [t.fg("dim", clipLine(item.text, width))];
+			}
+		}
+
+		handleInput(data: string): void {
+			if (matchesKey(data, "escape")) {
+				this.done({ type: "back" });
+				return;
+			}
+			if (matchesKey(data, "pageUp") || matchesKey(data, "ctrl+u")) {
+				this.scrollBack += 10;
+				this.tui.requestRender();
+				return;
+			}
+			if (matchesKey(data, "pageDown") || matchesKey(data, "ctrl+d")) {
+				this.scrollBack = Math.max(0, this.scrollBack - 10);
+				this.tui.requestRender();
+				return;
+			}
+			this.input.handleInput(data);
+			this.tui.requestRender();
+		}
+
+		render(width: number): string[] {
+			const t = this.theme;
+			const fork = this.fork;
+			const contentWidth = Math.max(20, width - 2);
+
+			const header = clipLine(
+				`${statusIcon(fork.status)} ${fork.name} · ${fork.status}${formatUsage(fork.usage) ? ` · ${formatUsage(fork.usage)}` : ""}`,
+				contentWidth,
+			);
+			const dismissed = !forks.has(fork.id);
+
+			// Flatten the transcript into wrapped lines.
+			const body: string[] = [];
+			for (const item of fork.transcript) {
+				for (const line of this.itemLines(item, contentWidth)) body.push(line);
+				if (item.type === "assistant") body.push("");
+			}
+
+			// Manual tail windowing: overlays get no viewport from the TUI and
+			// maxHeight truncates from the top, so slice the tail ourselves.
+			const rows = this.tui.terminal.rows;
+			const chrome = 6; // header + separators + input + hint + borders
+			const visibleCount = Math.max(
+				3,
+				Math.min(rows - chrome - 2, body.length),
+			);
+			this.scrollBack = Math.max(
+				0,
+				Math.min(this.scrollBack, Math.max(0, body.length - visibleCount)),
+			);
+			const end = body.length - this.scrollBack;
+			const visible = body.slice(Math.max(0, end - visibleCount), end);
+
+			const lines: string[] = [];
+			lines.push(t.fg("toolTitle", t.bold(` ${header}`)));
+			if (dismissed)
+				lines.push(t.fg("warning", " (fork dismissed — esc to close)"));
+			if (this.scrollBack > 0 || end - visibleCount > 0) {
+				lines.push(
+					t.fg("dim", ` ↑ ${Math.max(0, end - visibleCount)} more line(s)`),
+				);
+			} else {
+				lines.push(t.fg("dim", " ─".repeat(Math.floor(contentWidth / 2))));
+			}
+			for (const line of visible) lines.push(` ${line}`);
+			if (this.scrollBack > 0)
+				lines.push(
+					t.fg("dim", ` ↓ ${this.scrollBack} more line(s) (pageDown)`),
+				);
+			lines.push(t.fg("dim", " ─".repeat(Math.floor(contentWidth / 2))));
+			for (const line of this.input.render(contentWidth))
+				lines.push(` ${line}`);
+			lines.push(
+				t.fg("dim", " enter send · pageUp/pageDown scroll · esc back"),
+			);
+			return lines;
+		}
+
+		invalidate(): void {}
+
+		dispose(): void {
+			// Viewer is a window onto the fork, never its owner: detach only.
+			this.disposed = true;
+			if (this.fork.onTranscriptUpdate)
+				this.fork.onTranscriptUpdate = undefined;
+		}
+	}
+
+	async function openSubtasksUI(ctx: ExtensionContext): Promise<void> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			const summary = [...forks.values()]
+				.map((f) => `${statusIcon(f.status)} [${f.id}] ${f.name} — ${f.status}`)
+				.join("; ");
+			ctx.ui.notify(
+				summary || "No subtasks. Start one with /subtask <task>",
+				"info",
+			);
+			return;
+		}
+		if (uiOpen) return;
+		uiOpen = true;
+		try {
+			while (true) {
+				const action = await ctx.ui.custom<DockResult>(
+					(tui, theme, _kb, done) => new ForkDockComponent(tui, theme, done),
+					{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
+				);
+				if (!action || action.type === "close") return;
+				const fork = forks.get(action.forkId);
+				if (!fork) continue;
+				const viewed = await ctx.ui.custom<ViewerResult>(
+					(tui, theme, _kb, done) =>
+						new ForkViewerComponent(tui, theme, done, fork, ctx.cwd),
+					{ overlay: true, overlayOptions: { width: "95%", anchor: "center" } },
+				);
+				if (!viewed || viewed.type === "close") return;
+				// "back" → loop, dock reopens
+			}
+		} finally {
+			uiOpen = false;
+		}
 	}
 
 	// -------------------------------------------------------------- commands
 
 	pi.registerCommand("subtask", {
-		description: "Fork the conversation into a background subagent that works on <task>",
+		description:
+			"Fork the conversation into a background subagent that works on <task>",
 		handler: async (args, ctx) => {
 			lastCtx = ctx;
 			const task = args.trim();
@@ -528,128 +1130,236 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /subtask <task>", "error");
 				return;
 			}
-			let snapshot: { file: string; tempDir?: string };
-			try {
-				snapshot = writeSnapshot(ctx);
-			} catch (err) {
-				ctx.ui.notify(
-					`subtask: could not snapshot conversation: ${err instanceof Error ? err.message : err}`,
-					"error",
-				);
+			const result = startFork(ctx, task, false);
+			if (typeof result === "string") {
+				ctx.ui.notify(`subtask: ${result}`, "error");
 				return;
 			}
-			const fork: Fork = {
-				id: nextId++,
-				name: forkName(task),
-				task,
-				sessionFile: snapshot.file,
-				tempDir: snapshot.tempDir,
-				proc: null,
-				status: "starting",
-				activity: "",
-				finalText: "",
-				errorText: "",
-				usage: { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-				startedAt: Date.now(),
-				promptAccepted: false,
-				agentStarted: false,
-				completed: false,
-			};
-			forks.set(fork.id, fork);
-			spawnFork(fork, ctx.cwd, task);
-			renderWidget();
-			ctx.ui.notify(`Subtask "${fork.name}" started in the background`, "info");
+			ctx.ui.notify(
+				`Subtask "${result.name}" started in the background`,
+				"info",
+			);
 		},
 	});
 
 	pi.registerCommand("subtasks", {
-		description: "List and manage running and recent subtask forks",
+		description:
+			"Open the subtask dock: live transcripts, steer, stop, resume, dismiss",
 		handler: async (_args, ctx) => {
 			lastCtx = ctx;
-			const rows = [...forks.values()];
-			if (rows.length === 0) {
-				ctx.ui.notify("No subtasks. Start one with /subtask <task>", "info");
-				return;
-			}
-			const labels = rows.map((f) => `${statusIcon(f.status)} [${f.id}] ${f.name} — ${f.status}`);
-			const picked = await ctx.ui.select("Subtasks", labels);
-			if (picked === undefined) return;
-			const fork = rows[labels.indexOf(picked)];
-			if (!fork) return;
+			await openSubtasksUI(ctx);
+		},
+	});
 
-			const running = fork.proc !== null && !fork.completed;
-			const actions = running
-				? ["Steer (send message)", "Stop", "Show output"]
-				: ["Follow up (resume fork)", "Show output", "Dismiss"];
-			const action = await ctx.ui.select(`${fork.name} (${fork.status})`, actions);
-			if (action === undefined) return;
+	pi.registerShortcut("alt+t", {
+		description: "Open the subtask dock",
+		handler: async (ctx) => {
+			lastCtx = ctx;
+			await openSubtasksUI(ctx);
+		},
+	});
 
-			if (action.startsWith("Steer") || action.startsWith("Follow up")) {
-				const message = await ctx.ui.editor(`Message to "${fork.name}"`, "");
-				if (!message?.trim()) return;
-				sendToFork(fork, message.trim(), ctx.cwd);
-				ctx.ui.notify(running ? "Steering message queued" : "Fork resumed", "info");
-			} else if (action === "Stop") {
-				fork.proc?.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
-				completeFork(fork, "stopped");
-				ctx.ui.notify(`Stopped "${fork.name}"`, "info");
-			} else if (action === "Show output") {
-				pi.appendEntry("subtask-output", {
-					name: fork.name,
-					task: fork.task,
-					status: fork.status,
-					sessionFile: fork.sessionFile,
-					text: fork.finalText || fork.errorText || "(no output yet)",
-				});
-			} else if (action === "Dismiss") {
-				removeFork(fork);
-				renderWidget();
+	// ---------------------------------------------------- model-facing tool
+
+	function registerSubtaskTool() {
+		if (subtaskToolRegistered) return;
+		subtaskToolRegistered = true;
+		pi.registerTool({
+			name: "subtask",
+			label: "Subtask",
+			description: [
+				"Fork this conversation into a background subagent that inherits everything discussed so far",
+				"(system prompt, model, full history) and works on `task` independently while you keep going.",
+				"Its tool calls stay out of this conversation; only its final result comes back as a message when it finishes.",
+				"Use it when a side task needs the context already established here but its intermediate work would be noise,",
+				"or to explore approaches in parallel. Returns immediately with a receipt - you are not blocked.",
+				"Do not poll or wait for the result; you will be notified in a later turn.",
+				"A fork cannot itself spawn further forks.",
+			].join(" "),
+			parameters: SubtaskToolParams,
+			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+				if (runningModelForks() >= MAX_MODEL_FORKS) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Concurrent subtask limit reached (${MAX_MODEL_FORKS} running). Wait for one to finish, or the user can stop one in /subtasks. Do not retry immediately.`,
+							},
+						],
+						isError: true,
+					};
+				}
+				lastCtx = ctx as unknown as ExtensionContext;
+				const result = startFork(
+					ctx as unknown as ExtensionContext,
+					params.task,
+					true,
+				);
+				if (typeof result === "string") {
+					return {
+						content: [
+							{ type: "text", text: `subtask failed to start: ${result}` },
+						],
+						isError: true,
+					};
+				}
+				return {
+					content: [
+						{
+							type: "text",
+							text: [
+								`Subtask "${result.name}" (id ${result.id}) started in the background.`,
+								"",
+								"You will be notified when it finishes — do not poll or wait, continue other work or end your turn.",
+								"The user can watch or steer it with /subtasks.",
+							].join("\n"),
+						},
+					],
+					details: {
+						forkId: result.id,
+						name: result.name,
+						sessionFile: result.sessionFile,
+					},
+				};
+			},
+			renderCall(args, theme) {
+				const preview = args.task
+					? args.task.length > 60
+						? `${args.task.slice(0, 60)}...`
+						: args.task
+					: "...";
+				return new Text(
+					theme.fg("toolTitle", theme.bold("subtask ")) +
+						theme.fg("accent", forkName(args.task ?? "")) +
+						theme.fg("dim", ` ${preview}`),
+					0,
+					0,
+				);
+			},
+		});
+	}
+
+	function setSubtaskToolEnabled(enabled: boolean, ctx: ExtensionContext) {
+		if (enabled) {
+			registerSubtaskTool();
+			const active = pi.getActiveTools();
+			if (!active.includes("subtask"))
+				pi.setActiveTools([...active, "subtask"]);
+			subtaskToolOn = true;
+			ctx.ui.notify(
+				"subtask tool enabled — the model can now spawn forks (max 4 concurrent)",
+				"info",
+			);
+		} else {
+			if (subtaskToolRegistered) {
+				pi.setActiveTools(pi.getActiveTools().filter((n) => n !== "subtask"));
 			}
+			subtaskToolOn = false;
+			ctx.ui.notify("subtask tool disabled", "info");
+		}
+	}
+
+	pi.registerCommand("subtask-tool", {
+		description:
+			"Enable/disable the model-facing subtask tool: /subtask-tool on|off",
+		getArgumentCompletions: (prefix) =>
+			["on", "off"]
+				.filter((v) => v.startsWith(prefix.trim()))
+				.map((v) => ({ value: v, label: v })),
+		handler: async (args, ctx) => {
+			lastCtx = ctx;
+			const arg = args.trim().toLowerCase();
+			if (arg === "on") setSubtaskToolEnabled(true, ctx);
+			else if (arg === "off") setSubtaskToolEnabled(false, ctx);
+			else
+				ctx.ui.notify(
+					`subtask tool is ${subtaskToolOn ? "on" : "off"} — /subtask-tool on|off`,
+					"info",
+				);
 		},
 	});
 
 	// ------------------------------------------------------------- rendering
 
-	pi.registerMessageRenderer<SubtaskResultDetails>("subtask-result", (message, { expanded }, theme) => {
-		const details = message.details;
-		const ok = details?.status === "done";
-		const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
-		const usage = details ? formatUsage(details.usage) : "";
-		const header = `${icon} ${theme.fg("toolTitle", theme.bold(`subtask ${details?.name ?? ""}`))}${usage ? theme.fg("dim", ` · ${usage}`) : ""}`;
+	pi.registerMessageRenderer<SubtaskResultDetails>(
+		"subtask-result",
+		(message, { expanded }, theme) => {
+			const details = message.details;
+			const ok = details?.status === "done";
+			const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
+			const usage = details ? formatUsage(details.usage) : "";
+			const header = `${icon} ${theme.fg("toolTitle", theme.bold(`subtask ${details?.name ?? ""}`))}${usage ? theme.fg("dim", ` · ${usage}`) : ""}`;
 
-		const container = new Container();
-		container.addChild(new Text(header, 0, 0));
-		const body = typeof message.content === "string" ? message.content : "";
-		const resultText = body.split("\nResult:\n").slice(1).join("\nResult:\n") || body;
-		if (expanded) {
-			if (details) container.addChild(new Text(theme.fg("dim", `task: ${details.task}`), 0, 0));
-			container.addChild(new Spacer(1));
-			container.addChild(new Markdown(resultText.trim(), 0, 0, getMarkdownTheme()));
-			if (details) {
-				container.addChild(new Spacer(1));
-				container.addChild(new Text(theme.fg("dim", `transcript: ${details.sessionFile}`), 0, 0));
-			}
-		} else {
-			const preview = resultText.trim().split("\n").slice(0, 6).join("\n");
-			container.addChild(new Text(theme.fg("toolOutput", preview), 0, 0));
-			container.addChild(new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0));
-		}
-		return container;
-	});
-
-	pi.registerEntryRenderer<{ name: string; task: string; status: string; sessionFile: string; text: string }>(
-		"subtask-output",
-		(entry, _options, theme) => {
-			const data = entry.data;
-			if (!data) return undefined;
 			const container = new Container();
-			container.addChild(new Text(theme.fg("toolTitle", theme.bold(`subtask output: ${data.name}`)), 0, 0));
-			container.addChild(new Text(theme.fg("dim", `${data.status} · ${data.sessionFile}`), 0, 0));
-			container.addChild(new Spacer(1));
-			container.addChild(new Markdown(data.text.trim(), 0, 0, getMarkdownTheme()));
+			container.addChild(new Text(header, 0, 0));
+			const body = typeof message.content === "string" ? message.content : "";
+			const resultText =
+				details?.resultText ??
+				(body
+					.split("<subtask-result")
+					.slice(1)
+					.join("")
+					.split(">")
+					.slice(1)
+					.join(">") ||
+					body);
+			if (expanded) {
+				if (details)
+					container.addChild(
+						new Text(theme.fg("dim", `task: ${details.task}`), 0, 0),
+					);
+				container.addChild(new Spacer(1));
+				container.addChild(
+					new Markdown(resultText.trim(), 0, 0, getMarkdownTheme()),
+				);
+				if (details) {
+					container.addChild(new Spacer(1));
+					container.addChild(
+						new Text(
+							theme.fg("dim", `transcript: ${details.sessionFile}`),
+							0,
+							0,
+						),
+					);
+				}
+			} else {
+				const preview = resultText.trim().split("\n").slice(0, 6).join("\n");
+				container.addChild(new Text(theme.fg("toolOutput", preview), 0, 0));
+				container.addChild(
+					new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0),
+				);
+			}
 			return container;
 		},
 	);
+
+	// Kept for sessions that contain entries appended by older versions.
+	pi.registerEntryRenderer<{
+		name: string;
+		task: string;
+		status: string;
+		sessionFile: string;
+		text: string;
+	}>("subtask-output", (entry, _options, theme) => {
+		const data = entry.data;
+		if (!data) return undefined;
+		const container = new Container();
+		container.addChild(
+			new Text(
+				theme.fg("toolTitle", theme.bold(`subtask output: ${data.name}`)),
+				0,
+				0,
+			),
+		);
+		container.addChild(
+			new Text(theme.fg("dim", `${data.status} · ${data.sessionFile}`), 0, 0),
+		);
+		container.addChild(new Spacer(1));
+		container.addChild(
+			new Markdown(data.text.trim(), 0, 0, getMarkdownTheme()),
+		);
+		return container;
+	});
 
 	// ------------------------------------------------------------ lifecycle
 
