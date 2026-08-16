@@ -253,10 +253,10 @@ function capResult(text: string): string {
 	return `${truncated}\n\n[Truncated. Full transcript in the fork's session file.]`;
 }
 
-/** Truncate a plain (unstyled) string to a display width, ASCII-safe. */
+/** Truncate a string to a display width (ANSI/wide-char aware). */
 function clipLine(text: string, width: number): string {
-	if (text.length <= width) return text;
-	return `${text.slice(0, Math.max(0, width - 1))}…`;
+	if (visibleWidth(text) <= width) return text;
+	return `${truncateToWidth(text, Math.max(0, width - 1), "")}…`;
 }
 
 /**
@@ -546,7 +546,12 @@ export default function (pi: ExtensionAPI) {
 				: "enter to view · x to stop/dismiss · esc back";
 		const lines = [clipLine(hint, width)];
 		// Filled marker = the view you're in, hollow = the others (Claude Code).
-		lines.push(`${panelSel === 0 ? "❯" : " "} ${viewPane ? "◯" : "●"} main`);
+		lines.push(
+			clipLine(
+				`${panelSel === 0 ? "❯" : " "} ${viewPane ? "◯" : "●"} main`,
+				width,
+			),
+		);
 		rows.forEach((f, i) => {
 			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
 			const viewed = f.id === viewedId;
@@ -570,9 +575,17 @@ export default function (pi: ExtensionAPI) {
 				f.status === "running" || f.status === "starting"
 					? f.activity || "..."
 					: f.status;
-			const room = Math.max(8, width - prefix.length - suffix.length);
+			const room = Math.max(
+				8,
+				width - visibleWidth(prefix) - visibleWidth(suffix),
+			);
+			// Final clip is the hard guard: pi's renderer throws on over-width
+			// lines, so a row must never exceed the width even on tiny terminals.
 			lines.push(
-				clipLine(prefix, width - 1) + clipLine(activity, room) + suffix,
+				clipLine(
+					clipLine(prefix, width - 1) + clipLine(activity, room) + suffix,
+					width,
+				),
 			);
 		});
 		return lines;
@@ -1069,7 +1082,7 @@ export default function (pi: ExtensionAPI) {
 		return [...running, ...finished];
 	}
 
-	const mdCache = new WeakMap<
+	let mdCache = new WeakMap<
 		TranscriptItem,
 		{ width: number; lines: string[] }
 	>();
@@ -1172,7 +1185,8 @@ export default function (pi: ExtensionAPI) {
 			// Manual tail windowing: overlays get no viewport from the TUI and
 			// maxHeight truncates from the top, so slice the tail ourselves.
 			const rows = this.tui.terminal.rows;
-			const bottomChrome = 8 + widgetRows().length; // editor+footer+widget+hints
+			// The widget renders panelRows() whenever a view is open.
+			const bottomChrome = 8 + panelRows().length; // editor+footer+widget+hints
 			const visibleCount = Math.max(3, rows - bottomChrome - 2);
 			this.scrollBack = Math.max(
 				0,
@@ -1202,7 +1216,11 @@ export default function (pi: ExtensionAPI) {
 			return lines;
 		}
 
-		invalidate(): void {}
+		invalidate(): void {
+			// Styled markdown lines cache theme colors; drop them so theme
+			// changes repaint correctly.
+			mdCache = new WeakMap();
+		}
 
 		dispose(): void {
 			// The pane is a window onto the fork, never its owner: detach only.
@@ -1290,7 +1308,7 @@ export default function (pi: ExtensionAPI) {
 						else if (target.id !== viewPane.fork.id) viewPane.setFork(target);
 					} else if (matchesKey(data, "escape")) {
 						panelSel = null;
-					} else if (data === "x" && panelSel > 0) {
+					} else if (matchesKey(data, "x") && panelSel > 0) {
 						const fork = rows[panelSel - 1];
 						if (fork) stopOrDismissFork(fork);
 						const remaining = panelRows().length;
@@ -1329,7 +1347,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (matchesKey(data, "return")) {
-					const text = this.getText().trim();
+					const text = (this.getExpandedText?.() ?? this.getText()).trim();
 					if (!text) return;
 					if (text.startsWith("/")) {
 						// Built-in commands still act on the main session, like
@@ -1371,7 +1389,7 @@ export default function (pi: ExtensionAPI) {
 				renderWidget();
 				if (fork) enterForkView(fork);
 				return;
-			} else if (data === "x" && panelSel > 0) {
+			} else if (matchesKey(data, "x") && panelSel > 0) {
 				const fork = rows[panelSel - 1];
 				if (fork) stopOrDismissFork(fork);
 				const remaining = panelRows().length;
@@ -1393,9 +1411,10 @@ export default function (pi: ExtensionAPI) {
 			// @agent-name marker, so it's clear where typed messages go.
 			if (viewPane && lines.length > 0) {
 				const label = ` @${forkName(viewPane.fork.name)} `;
-				if (visibleWidth(lines[0]) >= label.length + 4) {
+				const labelWidth = visibleWidth(label);
+				if (visibleWidth(lines[0]) >= labelWidth + 4) {
 					lines[0] =
-						truncateToWidth(lines[0], width - label.length - 2, "") +
+						truncateToWidth(lines[0], width - labelWidth - 2, "") +
 						label +
 						"──";
 				}
