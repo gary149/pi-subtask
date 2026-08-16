@@ -121,6 +121,12 @@ interface Fork {
 	/** Model and thinking level pinned at spawn (survives empty snapshots). */
 	model?: string;
 	thinkingLevel?: string;
+	/** Context window of the pinned model, for the ctx gauge. */
+	contextWindow?: number;
+	/** Latest turn's total context tokens and generation speed. */
+	lastTotalTokens: number;
+	tps?: number;
+	turnStartedAt?: number;
 	/** Ring buffer of transcript items feeding the live viewer. */
 	transcript: TranscriptItem[];
 	/** Set by an open viewer so new items trigger a repaint. */
@@ -571,11 +577,20 @@ export default function (pi: ExtensionAPI) {
 			// terminal scrollback on re-renders).
 			if (viewPane) {
 				const f = viewPane.fork;
+				const parts = [`⏺ @${f.name}`, f.status];
+				if (f.tps) parts.push(`${f.tps.toFixed(1)} tok/s`);
 				const usage = formatUsage(f.usage);
-				lastCtx.ui.setStatus(
-					"subtask",
-					`⏺ @${f.name} · ${f.status}${usage ? ` · ${usage}` : ""} · esc to return to main`,
-				);
+				if (usage) parts.push(usage);
+				if (f.contextWindow && f.lastTotalTokens) {
+					const pct = (f.lastTotalTokens / f.contextWindow) * 100;
+					const window =
+						f.contextWindow >= 1_000_000
+							? `${(f.contextWindow / 1_000_000).toFixed(1)}M`
+							: formatTokens(f.contextWindow);
+					parts.push(`${pct.toFixed(1)}%/${window}`);
+				}
+				parts.push("esc to return to main");
+				lastCtx.ui.setStatus("subtask", parts.join(" · "));
 			} else {
 				lastCtx.ui.setStatus("subtask", undefined);
 			}
@@ -825,6 +840,11 @@ export default function (pi: ExtensionAPI) {
 					fork.agentStarted = true;
 					fork.status = "running";
 					break;
+				case "message_start": {
+					const msg = event.message as Message | undefined;
+					if (msg?.role === "assistant") fork.turnStartedAt = Date.now();
+					break;
+				}
 				case "tool_execution_start": {
 					const name = String(event.toolName ?? "tool");
 					const args = (event.args as Record<string, unknown>) ?? {};
@@ -879,6 +899,13 @@ export default function (pi: ExtensionAPI) {
 							fork.usage.cacheRead += usage.cacheRead || 0;
 							fork.usage.cacheWrite += usage.cacheWrite || 0;
 							fork.usage.cost += usage.cost?.total || 0;
+							fork.lastTotalTokens =
+								(usage as { totalTokens?: number }).totalTokens ??
+								fork.lastTotalTokens;
+							if (fork.turnStartedAt && usage.output) {
+								const secs = (Date.now() - fork.turnStartedAt) / 1000;
+								if (secs > 0.2) fork.tps = usage.output / secs;
+							}
 						}
 						const text = lastAssistantText(msg);
 						if (text) {
@@ -1025,6 +1052,8 @@ export default function (pi: ExtensionAPI) {
 			spawnedByModel,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
 			thinkingLevel: ctx.thinkingLevel,
+			contextWindow: ctx.model?.contextWindow,
+			lastTotalTokens: 0,
 			parentSessionId: ctx.sessionManager.getSessionId(),
 			parentLeafId: ctx.sessionManager.getLeafId(),
 			cwd,
