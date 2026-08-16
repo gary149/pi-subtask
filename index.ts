@@ -18,8 +18,8 @@
  *   /subtask <task>       Start a fork working on <task> in the background
  *   /subtasks (or Alt+T) Open the fork dock: watch live transcripts, steer,
  *                         stop, resume, dismiss
- *   /subtask-tool on|off  Let the model spawn forks itself via a `subtask`
- *                         tool (off by default)
+ *   /subtask-tool on|off  Toggle the model-facing `subtask` tool, which lets
+ *                         the model spawn forks itself (on by default)
  *
  * Dock keys: up/down select, enter opens the live transcript viewer, x stops a
  * running fork or dismisses a finished one, esc closes. Inside the viewer,
@@ -459,7 +459,7 @@ export default function (pi: ExtensionAPI) {
 	/** Reentrancy guard for the dock/viewer UI (Alt+T while already open). */
 	let uiOpen = false;
 	let subtaskToolRegistered = false;
-	let subtaskToolOn = false;
+	let subtaskToolOn = true;
 
 	// ------------------------------------------------------------ transcript
 
@@ -636,7 +636,23 @@ export default function (pi: ExtensionAPI) {
 		renderWidget();
 	}
 
-	function spawnFork(fork: Fork, cwd: string, prompt: string) {
+	/**
+	 * Frame the initial task so the fork understands its role. It inherits the
+	 * whole conversation, including instructions addressed to the original
+	 * assistant ("don't answer X yourself", "delegate this"), and without
+	 * framing it can apply those to itself and refuse its own task.
+	 */
+	function frameInitialTask(task: string): string {
+		return [
+			"You are a fork of this conversation: a background copy spawned to work on one specific task while the original conversation continues without you.",
+			"Everything above is inherited context. Instructions there about how to respond, who should answer what, or delegating to subtasks applied to the original assistant, not to you.",
+			"Your only objective is the task below. Work on it and end with your result; your final message is delivered back to the original conversation.",
+			"",
+			`Task: ${task}`,
+		].join("\n");
+	}
+
+	function spawnFork(fork: Fork, cwd: string, prompt: string, displayText?: string) {
 		const invocation = getPiInvocation([
 			"--mode",
 			"rpc",
@@ -667,7 +683,11 @@ export default function (pi: ExtensionAPI) {
 		let agentStartWatchdog: ReturnType<typeof setTimeout> | undefined;
 		proc.stdout.setEncoding("utf-8");
 		proc.stderr.setEncoding("utf-8");
-		pushTranscriptItem(fork, { type: "user", text: prompt, ts: Date.now() });
+		pushTranscriptItem(fork, {
+			type: "user",
+			text: displayText ?? prompt,
+			ts: Date.now(),
+		});
 
 		const handleEvent = (event: Record<string, unknown>) => {
 			switch (event.type) {
@@ -899,7 +919,7 @@ export default function (pi: ExtensionAPI) {
 			completed: false,
 		};
 		forks.set(fork.id, fork);
-		spawnFork(fork, cwd, task);
+		spawnFork(fork, cwd, frameInitialTask(task), task);
 		renderWidget();
 		return fork;
 	}
@@ -1369,9 +1389,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// The model-facing tool is on by default (Claude Code parity); /subtask-tool
+	// off removes it for the session.
+	registerSubtaskTool();
+
 	pi.registerCommand("subtask-tool", {
 		description:
-			"Enable/disable the model-facing subtask tool: /subtask-tool on|off",
+			"Enable/disable the model-facing subtask tool: /subtask-tool on|off (on by default)",
 		getArgumentCompletions: (prefix) =>
 			["on", "off"]
 				.filter((v) => v.startsWith(prefix.trim()))
