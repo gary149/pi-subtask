@@ -16,18 +16,17 @@
  *
  * Commands:
  *   /subtask <task>       Start a fork working on <task> in the background
- *   /subtasks (or Alt+T) Open the fork dock: watch live transcripts, steer,
- *                         stop, resume, dismiss
  *   /subtask-tool on|off  Toggle the model-facing `subtask` tool, which lets
  *                         the model spawn forks itself (on by default)
  *
  * Panel: press down on an empty prompt to select a fork directly in the
  * status rows below the editor (up/down move, x stops/dismisses, esc or
- * typing returns to the prompt); enter replaces the main view with the
- * fork's live transcript, Claude Code style: the prompt stays and is
- * relabeled @fork - typing steers the fork while it runs or resumes it
- * when finished, pageUp/pageDown scroll, esc returns to the main view.
- * Alt+T opens the same rows as a dock overlay.
+ * typing returns to the prompt); focusing the panel also reveals finished
+ * forks that aged out of the idle view, so they stay resumable. Enter
+ * replaces the main view with the fork's live transcript, Claude Code
+ * style: the prompt stays and is relabeled @fork - typing steers the fork
+ * while it runs or resumes it when finished, pageUp/pageDown scroll, esc
+ * returns to the main view.
  *
  * Notes:
  * - Running forks appear in a panel below the editor.
@@ -469,10 +468,6 @@ export default function (pi: ExtensionAPI) {
 	const forks = new Map<number, Fork>();
 	let nextId = 1;
 	let lastCtx: ExtensionContext | undefined;
-	/** Set while the dock overlay is open so state changes repaint it. */
-	let dockRerender: (() => void) | undefined;
-	/** Reentrancy guard for the dock/viewer UI (Alt+T while already open). */
-	let uiOpen = false;
 	let subtaskToolRegistered = false;
 	let subtaskToolOn = true;
 
@@ -489,7 +484,7 @@ export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------- widget
 
 	function widgetRows(): Fork[] {
-		// Finished rows age out of the widget but stay available in /subtasks.
+		// Finished rows age out of the idle widget but stay in panelRows().
 		return [...forks.values()].filter((f) => {
 			if (f.id === viewPane?.fork.id) return true;
 			if (!f.finishedAt) return true;
@@ -512,7 +507,9 @@ export default function (pi: ExtensionAPI) {
 	let panelSel: number | null = null;
 
 	function widgetLines(width: number): string[] {
-		const rows = widgetRows();
+		// Focused: every retained fork (aged-out finished ones included, like
+		// Claude Code's /tasks). Idle: only recent rows.
+		const rows = panelSel === null ? widgetRows() : panelRows();
 		if (panelSel !== null && panelSel > rows.length) {
 			panelSel = rows.length;
 		}
@@ -520,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 		const hint = viewPane
 			? `viewing @${viewPane.fork.name} — typing goes to the fork · esc back to main`
 			: panelSel === null
-				? `subtasks (${rows.length}) — ↓ to select · alt+t dock`
+				? `subtasks (${rows.length}) — ↓ to select`
 				: "enter to view · x to stop/dismiss · esc back";
 		const lines = [clipLine(hint, width)];
 		// Filled marker = the view you're in, hollow = the others (Claude Code).
@@ -548,11 +545,11 @@ export default function (pi: ExtensionAPI) {
 	let widgetVisible = false;
 
 	function renderWidget() {
-		dockRerender?.();
 		if (!lastCtx?.hasUI) return;
 		try {
-			const rows = widgetRows();
-			if (rows.length === 0) {
+			const visibleRows =
+				panelSel !== null || viewPane ? panelRows() : widgetRows();
+			if (visibleRows.length === 0) {
 				if (widgetVisible) {
 					lastCtx.ui.setWidget("subtasks", undefined);
 					widgetVisible = false;
@@ -650,10 +647,10 @@ export default function (pi: ExtensionAPI) {
 				);
 				if (!branchIds.has(fork.parentLeafId)) {
 					console.error(
-						`subtask: conversation moved to another branch; not delivering result of "${fork.name}" (see /subtasks)`,
+						`subtask: conversation moved to another branch; not delivering result of "${fork.name}"`,
 					);
 					lastCtx.ui.notify(
-						`Subtask "${fork.name}" finished on another branch — open /subtasks to see its output`,
+						`Subtask "${fork.name}" finished on another branch — press down on the prompt to open it`,
 						"warning",
 					);
 					return;
@@ -696,7 +693,7 @@ export default function (pi: ExtensionAPI) {
 			ts: Date.now(),
 		});
 		if (status !== "stopped") deliverResult(fork);
-		// The fork stays in the map (resumable via /subtasks) but its widget row
+		// The fork stays in the map (resumable from the panel) but its widget row
 		// ages out; schedule a refresh so the row disappears without new events.
 		fork.finishedAt = Date.now();
 		trimRetainedForks();
@@ -1006,9 +1003,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------- dock UI
 
-	type DockResult = { type: "close" } | { type: "open"; forkId: number };
-
-	function dockRows(): Fork[] {
+	function panelRows(): Fork[] {
 		const all = [...forks.values()];
 		const running = all.filter((f) => !f.finishedAt);
 		const finished = all
@@ -1016,112 +1011,6 @@ export default function (pi: ExtensionAPI) {
 			.sort((a, b) => b.finishedAt! - a.finishedAt!);
 		return [...running, ...finished];
 	}
-
-	class ForkDockComponent {
-		private selected = 0;
-		private disposed = false;
-		private tui: TUI;
-		private theme: Theme;
-		private done: (result: DockResult) => void;
-
-		constructor(tui: TUI, theme: Theme, done: (result: DockResult) => void) {
-			this.tui = tui;
-			this.theme = theme;
-			this.done = done;
-			dockRerender = () => {
-				if (!this.disposed) this.tui.requestRender();
-			};
-		}
-
-		handleInput(data: string): void {
-			const rows = dockRows();
-			if (matchesKey(data, "escape")) {
-				this.done({ type: "close" });
-				return;
-			}
-			if (matchesKey(data, "up")) {
-				this.selected = Math.max(0, this.selected - 1);
-				this.tui.requestRender();
-				return;
-			}
-			if (matchesKey(data, "down")) {
-				this.selected = Math.min(
-					Math.max(0, rows.length - 1),
-					this.selected + 1,
-				);
-				this.tui.requestRender();
-				return;
-			}
-			if (matchesKey(data, "return") && rows.length > 0) {
-				const fork = rows[Math.min(this.selected, rows.length - 1)];
-				this.done({ type: "open", forkId: fork.id });
-				return;
-			}
-			if (data === "x" && rows.length > 0) {
-				const fork = rows[Math.min(this.selected, rows.length - 1)];
-				if (fork.proc && !fork.completed) {
-					fork.proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
-					completeFork(fork, "stopped");
-				} else {
-					removeFork(fork);
-					this.selected = Math.max(
-						0,
-						Math.min(this.selected, dockRows().length - 1),
-					);
-					renderWidget();
-				}
-				this.tui.requestRender();
-			}
-		}
-
-		render(width: number): string[] {
-			const t = this.theme;
-			const rows = dockRows();
-			const lines: string[] = [];
-			lines.push(t.fg("toolTitle", t.bold(" subtasks")));
-			if (rows.length === 0) {
-				lines.push(
-					t.fg("muted", " no subtasks — start one with /subtask <task>"),
-				);
-			}
-			this.selected = Math.max(
-				0,
-				Math.min(this.selected, Math.max(0, rows.length - 1)),
-			);
-			rows.forEach((f, i) => {
-				const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
-				const usage = formatUsage(f.usage);
-				const activity =
-					f.status === "running" || f.status === "starting"
-						? f.activity
-						: f.status;
-				const text = clipLine(
-					`${statusIcon(f.status)} [${f.id}] ${f.name} · ${activity}${usage ? ` · ${usage}` : ""} · ${elapsed}s`,
-					width - 4,
-				);
-				lines.push(
-					i === this.selected ? t.fg("accent", `▸ ${text}`) : `  ${text}`,
-				);
-			});
-			lines.push("");
-			lines.push(
-				t.fg(
-					"dim",
-					" ↑↓ select · enter open transcript · x stop/dismiss · esc close",
-				),
-			);
-			return lines;
-		}
-
-		invalidate(): void {}
-
-		dispose(): void {
-			this.disposed = true;
-			dockRerender = undefined;
-		}
-	}
-
-	// ------------------------------------------------------------ viewer UI
 
 	const mdCache = new WeakMap<
 		TranscriptItem,
@@ -1224,13 +1113,6 @@ export default function (pi: ExtensionAPI) {
 			const visible = body.slice(Math.max(0, end - visibleCount), end);
 
 			const lines: string[] = [];
-			const header = clipLine(
-				`${statusIcon(fork.status)} ${fork.name}${formatUsage(fork.usage) ? ` · ${formatUsage(fork.usage)}` : ""} · esc to return to main`,
-				contentWidth,
-			);
-			lines.push(t.fg("toolTitle", t.bold(` ${header}`)));
-			if (!forks.has(fork.id))
-				lines.push(t.fg("warning", " (fork dismissed — esc to close)"));
 			if (end - visibleCount > 0) {
 				lines.push(
 					t.fg(
@@ -1258,32 +1140,6 @@ export default function (pi: ExtensionAPI) {
 			this.disposed = true;
 			if (this.fork.onTranscriptUpdate)
 				this.fork.onTranscriptUpdate = undefined;
-		}
-	}
-
-	async function openSubtasksUI(ctx: ExtensionContext): Promise<void> {
-		if (ctx.mode !== "tui" || !ctx.hasUI) {
-			const summary = [...forks.values()]
-				.map((f) => `${statusIcon(f.status)} [${f.id}] ${f.name} — ${f.status}`)
-				.join("; ");
-			ctx.ui.notify(
-				summary || "No subtasks. Start one with /subtask <task>",
-				"info",
-			);
-			return;
-		}
-		if (uiOpen) return;
-		uiOpen = true;
-		try {
-			const action = await ctx.ui.custom<DockResult>(
-				(tui, theme, _kb, done) => new ForkDockComponent(tui, theme, done),
-				{ overlay: true, overlayOptions: { width: "90%", anchor: "center" } },
-			);
-			if (!action || action.type === "close") return;
-			const fork = forks.get(action.forkId);
-			if (fork) enterForkView(fork);
-		} finally {
-			uiOpen = false;
 		}
 	}
 
@@ -1383,7 +1239,7 @@ export default function (pi: ExtensionAPI) {
 				if (
 					matchesKey(data, "down") &&
 					this.getText() === "" &&
-					widgetRows().length > 0
+					forks.size > 0
 				) {
 					panelSel = 0;
 					renderWidget();
@@ -1392,7 +1248,7 @@ export default function (pi: ExtensionAPI) {
 				super.handleInput(data);
 				return;
 			}
-			const rows = widgetRows();
+			const rows = panelRows();
 			if (matchesKey(data, "up")) {
 				panelSel = panelSel === 0 ? null : panelSel - 1;
 			} else if (matchesKey(data, "down")) {
@@ -1408,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
 			} else if (data === "x" && panelSel > 0) {
 				const fork = rows[panelSel - 1];
 				if (fork) stopOrDismissFork(fork);
-				const remaining = widgetRows().length;
+				const remaining = panelRows().length;
 				if (panelSel > remaining) panelSel = remaining > 0 ? remaining : null;
 			} else {
 				// Any other key returns focus to the editor and types normally,
@@ -1462,23 +1318,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("subtasks", {
-		description:
-			"Open the subtask dock: live transcripts, steer, stop, resume, dismiss",
-		handler: async (_args, ctx) => {
-			lastCtx = ctx;
-			await openSubtasksUI(ctx);
-		},
-	});
-
-	pi.registerShortcut("alt+t", {
-		description: "Open the subtask dock",
-		handler: async (ctx) => {
-			lastCtx = ctx;
-			await openSubtasksUI(ctx);
-		},
-	});
-
 	// ---------------------------------------------------- model-facing tool
 
 	function registerSubtaskTool() {
@@ -1503,7 +1342,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-								text: `Concurrent subtask limit reached (${MAX_MODEL_FORKS} running). Wait for one to finish, or the user can stop one in /subtasks. Do not retry immediately.`,
+								text: `Concurrent subtask limit reached (${MAX_MODEL_FORKS} running). Wait for one to finish, or the user can stop one from the subtask panel. Do not retry immediately.`,
 							},
 						],
 						isError: true,
@@ -1527,7 +1366,7 @@ export default function (pi: ExtensionAPI) {
 								`Subtask "${result.name}" (id ${result.id}) started in the background.`,
 								"",
 								"You will be notified when it finishes — do not poll or wait, continue other work or end your turn.",
-								"The user can watch or steer it with /subtasks.",
+								"The user can watch or steer it from the subtask panel below the prompt.",
 							].join("\n"),
 						},
 					],
@@ -1690,8 +1529,8 @@ export default function (pi: ExtensionAPI) {
 		widgetTui = undefined;
 		panelSel = null;
 		// Inline panel navigation needs an editor wrapper; respect another
-		// extension's custom editor (modal-editor etc.) if one is installed —
-		// the alt+t dock still covers everything in that case.
+		// extension's custom editor (modal-editor etc.) if one is installed.
+		// Without the wrapper there is no keyboard access to forks.
 		if (ctx.hasUI && !ctx.ui.getEditorComponent()) {
 			ctx.ui.setEditorComponent(
 				(tui, theme, kb) => new SubtaskEditor(tui, theme, kb),
