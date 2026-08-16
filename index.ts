@@ -1328,9 +1328,9 @@ export default function (pi: ExtensionAPI) {
 					this.getText() === "" &&
 					forks.size > 0
 				) {
-					const rows = panelRows();
-					const viewedIdx = rows.findIndex((f) => f.id === viewPane?.fork.id);
-					panelSel = viewedIdx >= 0 ? viewedIdx + 1 : 0;
+					// Enter navigation at the top (main), same as outside a view:
+					// one down + enter always returns to the main conversation.
+					panelSel = 0;
 					renderWidget();
 					return;
 				}
