@@ -1,8 +1,8 @@
 # pi-subtask
 
-Fork your pi conversation into a background subagent that reports back.
+**Subtasks are forks of your conversation that work in the background and report back to the main agent.**
 
-The fork inherits everything you've discussed, works on its own while you keep going, and delivers just its final result into your conversation.
+A fork starts out knowing everything you've discussed, works on its own while you keep going, and sends back just its final result.
 
 > Inspired by Claude Code's forked subagents.
 
