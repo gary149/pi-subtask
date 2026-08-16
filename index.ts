@@ -107,6 +107,11 @@ interface Fork {
 	spawnedByModel: boolean;
 	/** Parent session id at spawn time; delivery is skipped if it changed. */
 	parentSessionId: string;
+	/** Parent leaf entry id at spawn time; delivery is skipped if /tree moved
+	 * the conversation onto a branch that doesn't contain it. */
+	parentLeafId: string | null;
+	/** Working directory the fork runs in (spawn and resume). */
+	cwd: string;
 	/** Ring buffer of transcript items feeding the live viewer. */
 	transcript: TranscriptItem[];
 	/** Set by an open viewer so new items trigger a repaint. */
@@ -297,6 +302,58 @@ const FORWARDED_BOOL_FLAGS = new Set([
 	"--offline",
 ]);
 
+/**
+ * Pi built-in flags that must NOT reach the child: session identity, run mode,
+ * and display-only flags. Anything else starting with `--` is assumed to be an
+ * extension-registered flag (e.g. plan-mode's --plan) and is forwarded using
+ * the same value heuristic as pi's own CLI parser, so parent safety modes
+ * carry over to the fork.
+ */
+const DROPPED_BUILTIN_FLAGS = new Set([
+	"--mode",
+	"--print",
+	"-p",
+	"--continue",
+	"-c",
+	"--resume",
+	"-r",
+	"--session",
+	"--session-id",
+	"--fork",
+	"--no-session",
+	"--name",
+	"-n",
+	"--model",
+	"--models",
+	"--thinking",
+	"--theme",
+	"--use-theme",
+	"--no-themes",
+	"--export",
+	"--list-models",
+	"--verbose",
+	"--tui-mode",
+	"--help",
+	"-h",
+	"--version",
+	"-v",
+]);
+const DROPPED_VALUE_FLAGS = new Set([
+	"--mode",
+	"--session",
+	"--session-id",
+	"--fork",
+	"--name",
+	"-n",
+	"--model",
+	"--models",
+	"--thinking",
+	"--theme",
+	"--use-theme",
+	"--export",
+	"--tui-mode",
+]);
+
 function parentConfigArgs(): string[] {
 	const argv = process.argv.slice(2);
 	const forwarded: string[] = [];
@@ -306,6 +363,20 @@ function parentConfigArgs(): string[] {
 			forwarded.push(arg);
 		} else if (FORWARDED_VALUE_FLAGS.has(arg) && i + 1 < argv.length) {
 			forwarded.push(arg, argv[++i]);
+		} else if (DROPPED_BUILTIN_FLAGS.has(arg)) {
+			if (DROPPED_VALUE_FLAGS.has(arg)) i++;
+		} else if (arg.startsWith("--")) {
+			// Unknown flag: extension-registered. Mirror pi's parser (args.ts):
+			// --flag=value passes through as one token; otherwise the next token
+			// is the value unless it looks like another flag or an @file.
+			forwarded.push(arg);
+			if (!arg.includes("=")) {
+				const next = argv[i + 1];
+				if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
+					forwarded.push(next);
+					i++;
+				}
+			}
 		}
 	}
 	return forwarded;
@@ -499,6 +570,24 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
+			// Same when /tree moved the conversation onto a branch that doesn't
+			// descend from the fork's spawn point: the session id is unchanged,
+			// but the result belongs to the other branch, not this one.
+			if (lastCtx && fork.parentLeafId) {
+				const branchIds = new Set(
+					lastCtx.sessionManager.getBranch().map((e) => e.id),
+				);
+				if (!branchIds.has(fork.parentLeafId)) {
+					console.error(
+						`subtask: conversation moved to another branch; not delivering result of "${fork.name}" (see /subtasks)`,
+					);
+					lastCtx.ui.notify(
+						`Subtask "${fork.name}" finished on another branch — open /subtasks to see its output`,
+						"warning",
+					);
+					return;
+				}
+			}
 			pi.sendMessage(
 				{
 					customType: "subtask-result",
@@ -568,9 +657,14 @@ export default function (pi: ExtensionAPI) {
 		fork.promptAccepted = false;
 		fork.agentStarted = false;
 		fork.errorText = "";
+		fork.finalText = "";
 		fork.finishedAt = undefined;
 		let stderr = "";
 		let buffer = "";
+		// A prompt consumed entirely by a child input handler or extension command
+		// reports success but never runs the agent; without this watchdog the fork
+		// would sit in "running" forever.
+		let agentStartWatchdog: ReturnType<typeof setTimeout> | undefined;
 		proc.stdout.setEncoding("utf-8");
 		proc.stderr.setEncoding("utf-8");
 		pushTranscriptItem(fork, { type: "user", text: prompt, ts: Date.now() });
@@ -582,6 +676,14 @@ export default function (pi: ExtensionAPI) {
 						if (event.success) {
 							fork.promptAccepted = true;
 							fork.status = "running";
+							agentStartWatchdog = setTimeout(() => {
+								if (!fork.completed && !fork.agentStarted) {
+									fork.finalText =
+										fork.finalText ||
+										"(the task was consumed by the child's input handling without an agent run)";
+									completeFork(fork, "done");
+								}
+							}, 15_000);
 						} else {
 							fork.errorText = String(event.error ?? "prompt rejected");
 							completeFork(fork, "failed");
@@ -590,6 +692,7 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 				case "agent_start":
+					if (agentStartWatchdog) clearTimeout(agentStartWatchdog);
 					fork.agentStarted = true;
 					fork.status = "running";
 					break;
@@ -610,7 +713,9 @@ export default function (pi: ExtensionAPI) {
 					const result = event.result as
 						| { isError?: boolean; content?: unknown }
 						| undefined;
-					const ok = !result?.isError;
+					// isError lives on the event itself; the result's own flag is a
+					// fallback for older wire formats.
+					const ok = !((event.isError as boolean | undefined) ?? result?.isError ?? false);
 					let summary = "";
 					if (Array.isArray(result?.content)) {
 						const text = result.content.find(
@@ -727,7 +832,7 @@ export default function (pi: ExtensionAPI) {
 		);
 	}
 
-	function sendToFork(fork: Fork, message: string, cwd: string) {
+	function sendToFork(fork: Fork, message: string) {
 		if (fork.proc && !fork.completed) {
 			// Running: queue as steering input on the live child.
 			pushTranscriptItem(fork, { type: "user", text: message, ts: Date.now() });
@@ -737,14 +842,14 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		// Finished: resume the fork's session file with a fresh process.
+		// Usage stays cumulative across resumes, like elapsed time.
 		if (fork.lingerTimer) clearTimeout(fork.lingerTimer);
-		fork.usage.turns = 0;
 		pushTranscriptItem(fork, {
 			type: "system",
 			text: "── resumed ──",
 			ts: Date.now(),
 		});
-		spawnFork(fork, cwd, message);
+		spawnFork(fork, fork.cwd, message);
 		renderWidget();
 	}
 
@@ -752,7 +857,12 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		task: string,
 		spawnedByModel: boolean,
+		cwdOverride?: string,
 	): Fork | string {
+		const cwd = cwdOverride ? path.resolve(ctx.cwd, cwdOverride) : ctx.cwd;
+		if (cwdOverride && !fs.existsSync(cwd)) {
+			return `working directory does not exist: ${cwd}`;
+		}
 		let snapshot: { file: string; tempDir?: string };
 		try {
 			snapshot = writeSnapshot(ctx);
@@ -781,13 +891,15 @@ export default function (pi: ExtensionAPI) {
 			startedAt: Date.now(),
 			spawnedByModel,
 			parentSessionId: ctx.sessionManager.getSessionId(),
+			parentLeafId: ctx.sessionManager.getLeafId(),
+			cwd,
 			transcript: [],
 			promptAccepted: false,
 			agentStarted: false,
 			completed: false,
 		};
 		forks.set(fork.id, fork);
-		spawnFork(fork, ctx.cwd, task);
+		spawnFork(fork, cwd, task);
 		renderWidget();
 		return fork;
 	}
@@ -926,25 +1038,22 @@ export default function (pi: ExtensionAPI) {
 		private theme: Theme;
 		private done: (result: ViewerResult) => void;
 		private fork: Fork;
-		private cwd: string;
 
 		constructor(
 			tui: TUI,
 			theme: Theme,
 			done: (result: ViewerResult) => void,
 			fork: Fork,
-			cwd: string,
 		) {
 			this.tui = tui;
 			this.theme = theme;
 			this.done = done;
 			this.fork = fork;
-			this.cwd = cwd;
 			this.input.focused = true;
 			this.input.onSubmit = (value: string) => {
 				const text = value.trim();
 				if (!text) return;
-				sendToFork(this.fork, text, this.cwd);
+				sendToFork(this.fork, text);
 				this.input.setValue("");
 				this.scrollBack = 0;
 				this.tui.requestRender();
@@ -1107,7 +1216,7 @@ export default function (pi: ExtensionAPI) {
 				if (!fork) continue;
 				const viewed = await ctx.ui.custom<ViewerResult>(
 					(tui, theme, _kb, done) =>
-						new ForkViewerComponent(tui, theme, done, fork, ctx.cwd),
+						new ForkViewerComponent(tui, theme, done, fork),
 					{ overlay: true, overlayOptions: { width: "95%", anchor: "center" } },
 				);
 				if (!viewed || viewed.type === "close") return;
@@ -1194,6 +1303,7 @@ export default function (pi: ExtensionAPI) {
 					ctx as unknown as ExtensionContext,
 					params.task,
 					true,
+					params.cwd,
 				);
 				if (typeof result === "string") {
 					return {
