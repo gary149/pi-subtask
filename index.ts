@@ -547,6 +547,19 @@ export default function (pi: ExtensionAPI) {
 	function renderWidget() {
 		if (!lastCtx?.hasUI) return;
 		try {
+			// While a fork view is open, its identity/usage lives in pi's status
+			// bar (not in the pane itself, which would leak lines into the
+			// terminal scrollback on re-renders).
+			if (viewPane) {
+				const f = viewPane.fork;
+				const usage = formatUsage(f.usage);
+				lastCtx.ui.setStatus(
+					"subtask",
+					`⏺ @${f.name} · ${f.status}${usage ? ` · ${usage}` : ""} · esc to return to main`,
+				);
+			} else {
+				lastCtx.ui.setStatus("subtask", undefined);
+			}
 			const visibleRows =
 				panelSel !== null || viewPane ? panelRows() : widgetRows();
 			if (visibleRows.length === 0) {
