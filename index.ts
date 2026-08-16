@@ -73,7 +73,7 @@ const MAX_RETAINED_FINISHED = 20;
 const RESULT_CAP_BYTES = 50 * 1024;
 const KILL_GRACE_MS = 3_000;
 const MAX_TRANSCRIPT_ITEMS = 500;
-const MAX_MODEL_FORKS = 4;
+const MAX_MODEL_FORKS = 8;
 
 interface ForkUsage {
 	turns: number;
