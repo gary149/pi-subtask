@@ -1182,12 +1182,13 @@ export default function (pi: ExtensionAPI) {
 		render(width: number): string[] {
 			const t = this.theme;
 			const fork = this.fork;
-			const contentWidth = Math.max(20, width - 2);
-
-			// Flatten the transcript into wrapped lines.
+			// Render at the full width and emit lines verbatim: pi's message
+			// components paint their own background boxes edge to edge and
+			// carry their own padding, so indenting them here would leave the
+			// first and last columns unpainted (notched corners).
 			const body: string[] = [];
 			for (const item of fork.transcript) {
-				for (const line of this.itemLines(item, contentWidth)) body.push(line);
+				for (const line of this.itemLines(item, width)) body.push(line);
 			}
 
 			// In-document widget: size to content, capped so the transcript
@@ -1217,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				lines.push("");
 			}
-			for (const line of visible) lines.push(` ${line}`);
+			for (const line of visible) lines.push(line);
 			if (this.scrollBack > 0)
 				lines.push(
 					t.fg("dim", ` ↓ ${this.scrollBack} more line(s) (pageDown)`),
