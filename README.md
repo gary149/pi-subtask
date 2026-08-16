@@ -24,7 +24,7 @@ Running forks appear in a panel below the editor with live activity, token usage
 /subtasks        (or Alt+T)
 ```
 
-Opens the fork dock. `↑↓` select a fork, `x` stops a running one or dismisses a finished one, `Esc` closes, and `Enter` opens the **live transcript viewer**: watch the fork's tool calls and replies stream in as it works, scroll with `PageUp`/`PageDown`, and type a message + `Enter` to talk to it directly. While it runs your message steers it; after it finishes, your message resumes it in place (it remembers both your conversation and its own work).
+Or skip the command entirely: press `↓` on an empty prompt to select a fork directly in the status rows under the editor (Claude Code style) — `↑↓` move, `Enter` opens the viewer, `x` stops/dismisses, `Esc` returns to typing. The dock overlay does the same: `↑↓` select a fork, `x` stops a running one or dismisses a finished one, `Esc` closes, and `Enter` opens the **live transcript viewer**: watch the fork's tool calls and replies stream in as it works, scroll with `PageUp`/`PageDown`, and type a message + `Enter` to talk to it directly. While it runs your message steers it; after it finishes, your message resumes it in place (it remembers both your conversation and its own work).
 
 The model can also delegate on its own: a `subtask` tool (enabled by default) lets it fork the conversation in the background when you ask it to, or when it judges a side investigation useful (max 4 concurrent). The tool returns immediately with a receipt and the result comes back as a notification in a later turn, so the model keeps working meanwhile. Disable it for a session with `/subtask-tool off`.
 

@@ -21,10 +21,12 @@
  *   /subtask-tool on|off  Toggle the model-facing `subtask` tool, which lets
  *                         the model spawn forks itself (on by default)
  *
- * Dock keys: up/down select, enter opens the live transcript viewer, x stops a
- * running fork or dismisses a finished one, esc closes. Inside the viewer,
- * type + enter sends a message to the fork (steers it while running, resumes
- * it when finished), pageUp/pageDown scroll, esc goes back.
+ * Panel: press down on an empty prompt to select a fork directly in the
+ * status rows below the editor (up/down move, enter opens the live viewer,
+ * x stops/dismisses, esc or typing returns to the prompt). Alt+T opens the
+ * same thing as a dock overlay. Inside the viewer, type + enter sends a
+ * message to the fork (steers it while running, resumes it when finished),
+ * pageUp/pageDown scroll, esc goes back.
  *
  * Notes:
  * - Running forks appear in a panel below the editor.
@@ -49,7 +51,10 @@ import type {
 	ExtensionContext,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import {
+	CustomEditor,
+	getMarkdownTheme,
+} from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import {
 	Container,
@@ -493,18 +498,28 @@ export default function (pi: ExtensionAPI) {
 	 * visible, which is why this is a Component (render receives the width)
 	 * instead of a plain string[] that the TUI would wrap.
 	 */
+	/**
+	 * Selection index for the inline panel: null = editor has focus, 0 = the
+	 * main row, i >= 1 = widgetRows()[i - 1]. Driven by the editor wrapper.
+	 */
+	let panelSel: number | null = null;
+
 	function widgetLines(width: number): string[] {
 		const rows = widgetRows();
-		const lines = [
-			clipLine(
-				`subtasks (${rows.length}) — alt+t or /subtasks to manage`,
-				width,
-			),
-		];
-		for (const f of rows) {
+		if (panelSel !== null && panelSel > rows.length) {
+			panelSel = rows.length;
+		}
+		const hint =
+			panelSel === null
+				? `subtasks (${rows.length}) — ↓ to select · alt+t dock`
+				: "enter to view · x to stop/dismiss · esc back";
+		const lines = [clipLine(hint, width)];
+		lines.push(`${panelSel === 0 ? "❯" : " "} ● main`);
+		rows.forEach((f, i) => {
 			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
 			const usage = formatUsage(f.usage);
-			const prefix = `${statusIcon(f.status)} ${f.name} · `;
+			const marker = panelSel === i + 1 ? "❯" : " ";
+			const prefix = `${marker} ${statusIcon(f.status)} ${f.name} · `;
 			const suffix = `${usage ? ` · ${usage}` : ""} · ${elapsed}s`;
 			const activity =
 				f.status === "running" || f.status === "starting"
@@ -514,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 			lines.push(
 				clipLine(prefix, width - 1) + clipLine(activity, room) + suffix,
 			);
-		}
+		});
 		return lines;
 	}
 
@@ -1301,6 +1316,82 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Open the live transcript viewer for one fork (no dock round-trip). */
+	async function openViewerFor(fork: Fork): Promise<void> {
+		const ctx = lastCtx;
+		if (!ctx || ctx.mode !== "tui" || !ctx.hasUI || uiOpen) return;
+		uiOpen = true;
+		try {
+			await ctx.ui.custom<ViewerResult>(
+				(tui, theme, _kb, done) =>
+					new ForkViewerComponent(tui, theme, done, fork),
+				{ overlay: true, overlayOptions: { width: "95%", anchor: "center" } },
+			);
+		} finally {
+			uiOpen = false;
+		}
+	}
+
+	function stopOrDismissFork(fork: Fork) {
+		if (fork.proc && !fork.completed) {
+			fork.proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
+			completeFork(fork, "stopped");
+		} else {
+			removeFork(fork);
+		}
+	}
+
+	/**
+	 * Editor wrapper for the inline panel, Claude Code style: pressing down on
+	 * an empty prompt moves selection into the subtask rows below the editor;
+	 * up/down navigate, enter opens the viewer, x stops or dismisses, escape
+	 * (or typing anything) returns focus to the editor.
+	 */
+	class SubtaskEditor extends CustomEditor {
+		handleInput(data: string): void {
+			if (panelSel === null) {
+				if (
+					matchesKey(data, "down") &&
+					this.getText() === "" &&
+					widgetRows().length > 0
+				) {
+					panelSel = 0;
+					renderWidget();
+					return;
+				}
+				super.handleInput(data);
+				return;
+			}
+			const rows = widgetRows();
+			if (matchesKey(data, "up")) {
+				panelSel = panelSel === 0 ? null : panelSel - 1;
+			} else if (matchesKey(data, "down")) {
+				panelSel = Math.min(rows.length, panelSel + 1);
+			} else if (matchesKey(data, "escape")) {
+				panelSel = null;
+			} else if (matchesKey(data, "return")) {
+				const fork = panelSel > 0 ? rows[panelSel - 1] : undefined;
+				panelSel = null;
+				renderWidget();
+				if (fork) void openViewerFor(fork);
+				return;
+			} else if (data === "x" && panelSel > 0) {
+				const fork = rows[panelSel - 1];
+				if (fork) stopOrDismissFork(fork);
+				const remaining = widgetRows().length;
+				if (panelSel > remaining) panelSel = remaining > 0 ? remaining : null;
+			} else {
+				// Any other key returns focus to the editor and types normally,
+				// like Claude Code's panel (x on the main row included).
+				panelSel = null;
+				renderWidget();
+				super.handleInput(data);
+				return;
+			}
+			renderWidget();
+		}
+	}
+
 	// -------------------------------------------------------------- commands
 
 	pi.registerCommand("subtask", {
@@ -1551,6 +1642,15 @@ export default function (pi: ExtensionAPI) {
 		// New session, new UI: the widget must re-register itself.
 		widgetVisible = false;
 		widgetTui = undefined;
+		panelSel = null;
+		// Inline panel navigation needs an editor wrapper; respect another
+		// extension's custom editor (modal-editor etc.) if one is installed —
+		// the alt+t dock still covers everything in that case.
+		if (ctx.hasUI && !ctx.ui.getEditorComponent()) {
+			ctx.ui.setEditorComponent(
+				(tui, theme, kb) => new SubtaskEditor(tui, theme, kb),
+			);
+		}
 		renderWidget();
 	});
 
