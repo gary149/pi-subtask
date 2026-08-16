@@ -553,7 +553,10 @@ export default function (pi: ExtensionAPI) {
 			),
 		);
 		rows.forEach((f, i) => {
-			const elapsed = Math.round((Date.now() - f.startedAt) / 1000);
+			// Finished forks freeze at their completion time; only running ones tick.
+			const elapsed = Math.round(
+				((f.finishedAt ?? Date.now()) - f.startedAt) / 1000,
+			);
 			const viewed = f.id === viewedId;
 			const stats: string[] = [];
 			if (viewed && f.tps) stats.push(`${f.tps.toFixed(1)} tok/s`);
