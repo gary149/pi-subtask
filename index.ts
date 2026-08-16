@@ -534,7 +534,7 @@ export default function (pi: ExtensionAPI) {
 	function widgetLines(width: number): string[] {
 		// Focused: every retained fork (aged-out finished ones included, like
 		// Claude Code's /tasks). Idle: only recent rows.
-		const rows = panelSel === null ? widgetRows() : panelRows();
+		const rows = panelSel === null && !viewPane ? widgetRows() : panelRows();
 		if (panelSel !== null && panelSel > rows.length) {
 			panelSel = rows.length;
 		}
@@ -564,7 +564,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const marker = panelSel === i + 1 ? "❯" : " ";
 			const icon = viewed ? "⏺" : statusIcon(f.status);
-			const prefix = `${marker} ${icon} ${f.name} · `;
+			const prefix = `${marker} ${icon} [${f.id}] ${f.name} · `;
 			const suffix = `${stats.length ? ` · ${stats.join(" · ")}` : ""} · ${elapsed}s`;
 			const activity =
 				f.status === "running" || f.status === "starting"
