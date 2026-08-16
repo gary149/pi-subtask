@@ -608,21 +608,34 @@ export default function (pi: ExtensionAPI) {
 			}
 			const marker = panelSel === i + 1 ? "❯" : " ";
 			const icon = viewed ? "⏺" : statusIcon(f.status);
-			const prefix = `${marker} ${icon} [${f.id}] ${f.name} · `;
+			const lead = `${marker} ${icon} `;
 			const suffix = `${stats.length ? ` · ${stats.join(" · ")}` : ""} · ${elapsed}s`;
 			const activity =
 				f.status === "running" || f.status === "starting"
 					? f.activity || "..."
 					: f.status;
-			const room = Math.max(
-				8,
-				width - visibleWidth(prefix) - visibleWidth(suffix),
-			);
+			// Adaptive layout: the name comes from the full task text and takes
+			// whatever width the activity and stats leave over, instead of a
+			// fixed 4-word truncation wasting available columns.
+			const name = f.task.replace(/\s+/g, " ").trim() || f.name;
+			const sep = " · ";
+			const budget =
+				width - visibleWidth(lead) - visibleWidth(suffix) - visibleWidth(sep);
+			const nameNat = visibleWidth(name);
+			const actNat = visibleWidth(activity);
+			// Activity keeps at least 12 columns (or its natural size when
+			// smaller); the name expands into the rest up to its full length.
+			const actRoom = Math.min(actNat, Math.max(12, budget - nameNat - 3));
+			const nameRoom = Math.max(12, budget - actRoom - 3);
 			// Final clip is the hard guard: pi's renderer throws on over-width
 			// lines, so a row must never exceed the width even on tiny terminals.
 			lines.push(
 				clipLine(
-					clipLine(prefix, width - 1) + clipLine(activity, room) + suffix,
+					lead +
+						clipLine(name, nameRoom) +
+						sep +
+						clipLine(activity, actRoom) +
+						suffix,
 					width,
 				),
 			);
@@ -1539,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text: [
-								`Subtask "${result.name}" (id ${result.id}) started in the background.`,
+								`Subtask "${result.name}" started in the background.`,
 								"",
 								"You will be notified when it finishes — do not poll or wait, continue other work or end your turn.",
 								"The user can watch or steer it from the subtask panel below the prompt.",
