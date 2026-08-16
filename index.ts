@@ -55,6 +55,7 @@ import {
 	AssistantMessageComponent,
 	CustomEditor,
 	getMarkdownTheme,
+	keyText,
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -141,6 +142,8 @@ interface Fork {
 	agentStarted: boolean;
 	/** Guards against double completion (settle event + process exit). */
 	completed: boolean;
+	/** Incremented per spawn; stale processes' events are dropped by it. */
+	spawnGen: number;
 	/** Set when the fork finishes; used to age rows out of the widget. */
 	finishedAt?: number;
 	/** Temp dir holding the snapshot when the parent session is ephemeral. */
@@ -232,12 +235,6 @@ function capResult(text: string): string {
 	while (Buffer.byteLength(truncated, "utf8") > RESULT_CAP_BYTES)
 		truncated = truncated.slice(0, -1);
 	return `${truncated}\n\n[Truncated. Full transcript in the fork's session file.]`;
-}
-
-/** Truncate a string to a display width (ANSI/wide-char aware). */
-function clipLine(text: string, width: number): string {
-	if (visibleWidth(text) <= width) return text;
-	return `${truncateToWidth(text, Math.max(0, width - 1), "")}…`;
 }
 
 /**
@@ -561,12 +558,13 @@ export default function (pi: ExtensionAPI) {
 			: panelSel === null
 				? `subtasks (${rows.length}) — ↓ to select`
 				: "enter to view · x to stop/dismiss · esc back";
-		const lines = [clipLine(hint, width)];
+		const lines = [truncateToWidth(hint, width, "…")];
 		// Filled marker = the view you're in, hollow = the others (Claude Code).
 		lines.push(
-			clipLine(
+			truncateToWidth(
 				`${panelSel === 0 ? "❯" : " "} ${viewPane ? "◯" : "●"} main`,
 				width,
+				"…",
 			),
 		);
 		rows.forEach((f, i) => {
@@ -611,13 +609,14 @@ export default function (pi: ExtensionAPI) {
 			// Final clip is the hard guard: pi's renderer throws on over-width
 			// lines, so a row must never exceed the width even on tiny terminals.
 			lines.push(
-				clipLine(
+				truncateToWidth(
 					lead +
-						clipLine(name, nameRoom) +
+						truncateToWidth(name, nameRoom, "…") +
 						sep +
-						clipLine(activity, actRoom) +
+						truncateToWidth(activity, actRoom, "…") +
 						suffix,
 					width,
+					"…",
 				),
 			);
 		});
@@ -837,6 +836,8 @@ export default function (pi: ExtensionAPI) {
 		fork.errorText = "";
 		fork.finalText = "";
 		fork.finishedAt = undefined;
+		fork.spawnGen += 1;
+		const gen = fork.spawnGen;
 		let stderr = "";
 		let buffer = "";
 		// A prompt consumed entirely by a child input handler or extension command
@@ -852,6 +853,12 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		const handleEvent = (event: Record<string, unknown>) => {
+			// Drop events from a stale process (fork was resumed since) and
+			// late stragglers after completion: without this, a child draining
+			// during its kill-grace window could append transcript items after
+			// the done divider, or a dead process's close could complete a
+			// resumed fork.
+			if (fork.spawnGen !== gen || fork.completed) return;
 			switch (event.type) {
 				case "response": {
 					if (event.command === "prompt") {
@@ -859,7 +866,11 @@ export default function (pi: ExtensionAPI) {
 							fork.promptAccepted = true;
 							fork.status = "running";
 							agentStartWatchdog = setTimeout(() => {
-								if (!fork.completed && !fork.agentStarted) {
+								if (
+									fork.spawnGen === gen &&
+									!fork.completed &&
+									!fork.agentStarted
+								) {
 									fork.finalText =
 										fork.finalText ||
 										"(the task was consumed by the child's input handling without an agent run)";
@@ -1000,6 +1011,7 @@ export default function (pi: ExtensionAPI) {
 			stderr += data;
 		});
 		proc.on("close", (code) => {
+			if (fork.spawnGen !== gen) return;
 			if (!fork.completed) {
 				if (code !== 0 && !fork.errorText)
 					fork.errorText = stderr.trim() || `pi exited with code ${code}`;
@@ -1014,6 +1026,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		proc.on("error", (err) => {
+			if (fork.spawnGen !== gen) return;
 			if (!fork.completed) {
 				fork.errorText = `failed to spawn pi: ${err.message}`;
 				completeFork(fork, "failed");
@@ -1094,6 +1107,7 @@ export default function (pi: ExtensionAPI) {
 			promptAccepted: false,
 			agentStarted: false,
 			completed: false,
+			spawnGen: 0,
 		};
 		forks.set(fork.id, fork);
 		spawnFork(fork, cwd, frameInitialTask(task), task);
@@ -1165,7 +1179,7 @@ export default function (pi: ExtensionAPI) {
 		private itemLines(item: TranscriptItem, width: number): string[] {
 			const t = this.theme;
 			if (item.type === "system") {
-				return [t.fg("dim", clipLine(item.text, width))];
+				return [t.fg("dim", truncateToWidth(item.text, width, "…"))];
 			}
 			let comp = forkComponentCache.get(item);
 			if (!comp) {
@@ -1559,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
 				pi.setActiveTools([...active, "subtask"]);
 			subtaskToolOn = true;
 			ctx.ui.notify(
-				"subtask tool enabled — the model can now spawn forks (max 4 concurrent)",
+				`subtask tool enabled — the model can now spawn forks (max ${MAX_MODEL_FORKS} concurrent)`,
 				"info",
 			);
 		} else {
@@ -1599,7 +1613,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerMessageRenderer<SubtaskResultDetails>(
 		"subtask-result",
-		(message, { expanded }, theme) => {
+		(message, { expanded, outputPad }, theme) => {
 			const details = message.details;
 			const ok = details?.status === "done";
 			const icon = ok ? theme.fg("success", "✓") : theme.fg("error", "✗");
@@ -1607,7 +1621,7 @@ export default function (pi: ExtensionAPI) {
 			const header = `${icon} ${theme.fg("toolTitle", theme.bold(`subtask ${details?.name ?? ""}`))}${usage ? theme.fg("dim", ` · ${usage}`) : ""}`;
 
 			const container = new Container();
-			container.addChild(new Text(header, 0, 0));
+			container.addChild(new Text(header, outputPad, 0));
 			const body = typeof message.content === "string" ? message.content : "";
 			const resultText =
 				details?.resultText ??
@@ -1622,27 +1636,33 @@ export default function (pi: ExtensionAPI) {
 			if (expanded) {
 				if (details)
 					container.addChild(
-						new Text(theme.fg("dim", `task: ${details.task}`), 0, 0),
+						new Text(theme.fg("dim", `task: ${details.task}`), outputPad, 0),
 					);
 				container.addChild(new Spacer(1));
 				container.addChild(
-					new Markdown(resultText.trim(), 0, 0, getMarkdownTheme()),
+					new Markdown(resultText.trim(), outputPad, 0, getMarkdownTheme()),
 				);
 				if (details) {
 					container.addChild(new Spacer(1));
 					container.addChild(
 						new Text(
 							theme.fg("dim", `transcript: ${details.sessionFile}`),
-							0,
+							outputPad,
 							0,
 						),
 					);
 				}
 			} else {
 				const preview = resultText.trim().split("\n").slice(0, 6).join("\n");
-				container.addChild(new Text(theme.fg("toolOutput", preview), 0, 0));
 				container.addChild(
-					new Text(theme.fg("muted", "(Ctrl+O to expand)"), 0, 0),
+					new Text(theme.fg("toolOutput", preview), outputPad, 0),
+				);
+				container.addChild(
+					new Text(
+						theme.fg("muted", `(${keyText("app.tools.expand")} to expand)`),
+						outputPad,
+						0,
+					),
 				);
 			}
 			return container;
