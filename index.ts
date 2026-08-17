@@ -228,6 +228,26 @@ function lastAssistantText(msg: Message): string {
 		.join("\n");
 }
 
+/**
+ * One-line summary leading the result notification. It is what /tree and
+ * other entry previews show for this message, so it has to identify which
+ * subtask finished and how, rather than repeating boilerplate.
+ */
+function resultHeadline(fork: Fork, body: string): string {
+	const gist = body
+		.split("\n")
+		.map((l) => l.trim())
+		.find((l) => l.length > 0 && !l.startsWith("#"));
+	const preview = gist ? gist.replace(/\s+/g, " ").slice(0, 120) : "";
+	const verb =
+		fork.status === "done"
+			? "finished"
+			: fork.status === "stopped"
+				? "was stopped"
+				: "failed";
+	return `Subtask "${fork.name}" ${verb}${preview ? `: ${preview}` : ""}`;
+}
+
 function capResult(text: string): string {
 	if (Buffer.byteLength(text, "utf8") <= RESULT_CAP_BYTES) return text;
 	let truncated = text.slice(0, RESULT_CAP_BYTES);
@@ -731,7 +751,7 @@ export default function (pi: ExtensionAPI) {
 			pi.sendMessage(
 				{
 					customType: "subtask-result",
-					content: `A background subtask forked from this conversation has finished. This is an automated notification, not a message typed by the user.\n\n<subtask-result name="${fork.name}" status="${fork.status}">\nTask: ${fork.task}\n\n${body}\n</subtask-result>`,
+					content: `${resultHeadline(fork, body)}\n\n(Automated notification from a background subtask you spawned, not a message typed by the user.)\n\n<subtask-result name="${fork.name}" status="${fork.status}">\nTask: ${fork.task}\n\n${body}\n</subtask-result>`,
 					display: true,
 					details,
 				},
