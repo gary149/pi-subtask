@@ -15,7 +15,7 @@ pi install git:github.com/gary149/pi-subtask
 ## Quick start
 
 ```
-/subtask review the changes we just discussed for concurrency bugs. Do not edit files.
+/subtask find every place in this repo that still assumes the old auth flow we just replaced
 ```
 
 That's it. The subtask appears in a panel under your prompt, and its result arrives as a message when it's done.
