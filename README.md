@@ -6,6 +6,8 @@ A subtask starts out knowing everything you've discussed, works on its own while
 
 > Inspired by Claude Code's forked subagents.
 
+<img width="954" height="720" alt="llama-cpp-3subtasks-zoom-720p-opt" src="https://github.com/user-attachments/assets/3145c534-7f76-4443-bf70-9626e455f3c3" />
+
 ## Install
 
 ```bash
