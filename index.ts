@@ -53,7 +53,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
-	CustomEditor,
 	DynamicBorder,
 	getMarkdownTheme,
 	keyText,
@@ -63,6 +62,7 @@ import {
 import type { TUI } from "@earendil-works/pi-tui";
 import {
 	Container,
+	isKeyRelease,
 	Markdown,
 	matchesKey,
 	Spacer,
@@ -254,6 +254,24 @@ function capResult(text: string): string {
 	while (Buffer.byteLength(truncated, "utf8") > RESULT_CAP_BYTES)
 		truncated = truncated.slice(0, -1);
 	return `${truncated}\n\n[Truncated. Full transcript in the fork's session file.]`;
+}
+
+export function shouldEnterSubtaskPanel(
+	data: string,
+	editorText: string,
+	hasForks: boolean,
+): boolean {
+	return !isKeyRelease(data) && matchesKey(data, "down") && editorText === "" && hasForks;
+}
+
+/** Pi does not expose focus state to extensions. */
+export function isSubtaskEditorFocused(tui: TUI | undefined, editor: unknown): boolean {
+	return (
+		tui !== undefined &&
+		editor !== undefined &&
+		!tui.hasOverlay() &&
+		Reflect.get(tui, "focusedComponent") === editor
+	);
 }
 
 /**
@@ -492,6 +510,7 @@ export default function (pi: ExtensionAPI) {
 	let lastCtx: ExtensionContext | undefined;
 	let subtaskToolRegistered = false;
 	let subtaskToolOn = true;
+	let terminalInputUnsubscribe: (() => void) | undefined;
 
 	// ------------------------------------------------------------ transcript
 
@@ -632,7 +651,34 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	let widgetTui: TUI | undefined;
+	let inputTui: TUI | undefined;
+	let mainEditor: unknown;
+	let mainEditorFactory: unknown;
 	let widgetVisible = false;
+
+	function isEditorComponent(component: unknown): boolean {
+		return (
+			component !== null &&
+			typeof component === "object" &&
+			typeof Reflect.get(component, "getText") === "function" &&
+			typeof Reflect.get(component, "setText") === "function"
+		);
+	}
+
+	function rememberMainEditor(tui: TUI, factory: unknown) {
+		inputTui = tui;
+		const focused = Reflect.get(tui, "focusedComponent");
+		if (!isEditorComponent(focused)) return;
+		mainEditor = focused;
+		mainEditorFactory = factory;
+	}
+
+	function refreshMainEditor(ctx: ExtensionContext) {
+		if (!inputTui) return;
+		const factory = ctx.ui.getEditorComponent();
+		if (factory === mainEditorFactory && mainEditor !== undefined) return;
+		rememberMainEditor(inputTui, factory);
+	}
 
 	function renderWidget(force = false) {
 		if (!lastCtx?.hasUI) return;
@@ -653,6 +699,7 @@ export default function (pi: ExtensionAPI) {
 					"subtasks",
 					(tui, _theme) => {
 						widgetTui = tui;
+						rememberMainEditor(tui, lastCtx?.ui.getEditorComponent());
 						return {
 							render: (width: number) => widgetLines(width),
 							invalidate: () => {},
@@ -1128,8 +1175,8 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Full-width fork transcript pane, Claude Code style: it visually replaces
 	 * the main conversation while pi's real editor keeps focus below it (the
-	 * overlay is non-capturing). Input routing while it's open lives in
-	 * SubtaskEditor; this component only displays and tails the transcript.
+	 * overlay is non-capturing). Input routing while it's open uses the
+	 * terminal-input listener; this component only displays and tails the transcript.
 	 */
 	class ForkPane {
 		private disposed = false;
@@ -1262,8 +1309,8 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Fork view state: while set, the fork's transcript pane covers the main
-	 * conversation (non-capturing overlay) and SubtaskEditor routes typed
-	 * messages to the fork — Claude Code's transcript-replacement UX.
+	 * conversation (non-capturing overlay) and the terminal-input listener
+	 * routes typed messages to the fork — Claude Code's transcript-replacement UX.
 	 */
 	let viewPane: ForkPane | undefined;
 
@@ -1379,117 +1426,83 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Editor wrapper for the inline panel, Claude Code style: pressing down on
-	 * an empty prompt moves selection into the subtask rows below the editor;
-	 * up/down navigate, enter opens the viewer, x stops or dismisses, escape
-	 * (or typing anything) returns focus to the editor.
+	 * Route panel and fork-view keys before whichever editor is installed. This
+	 * intentionally does not replace the editor: Powerline and other extensions
+	 * own their editors too, while the subtask panel only needs a few keys.
 	 */
-	class SubtaskEditor extends CustomEditor {
-		handleInput(data: string): void {
-			// Fork view open: input routes to the fork, Claude Code style.
-			if (viewPane) {
-				// Arrow navigation still works: select another row and switch
-				// the view in place (main row exits to the main conversation).
-				if (panelSelId !== null) {
-					const pane = viewPane;
-					const handled = handlePanelNav(data, {
-						holdAtMain: true,
-						onReturn: (target) => {
-							if (!target) exitForkView();
-							else if (target.id !== pane.fork.id) pane.setFork(target);
-						},
-					});
-					if (!handled) {
-						clearSelection();
-						renderWidget(true);
-						super.handleInput(data);
-					}
-					return;
-				}
-				if (
-					matchesKey(data, "down") &&
-					this.getText() === "" &&
-					forks.size > 0
-				) {
-					// Enter navigation at the top (main), same as outside a view:
-					// one down + enter always returns to the main conversation.
-					selectRow(panelRows(), 0);
-					renderWidget(true);
-					return;
-				}
-				if (matchesKey(data, "escape")) {
-					exitForkView();
-					return;
-				}
-				if (matchesKey(data, "pageUp")) {
-					viewPane.scrollBy(10);
-					return;
-				}
-				if (matchesKey(data, "pageDown")) {
-					viewPane.scrollBy(-10);
-					return;
-				}
-				if (matchesKey(data, "return")) {
-					const text = (this.getExpandedText?.() ?? this.getText()).trim();
-					if (!text) return;
-					if (text.startsWith("/")) {
-						// Built-in commands still act on the main session, like
-						// Claude Code's transcript view.
-						super.handleInput(data);
-						return;
-					}
-					this.setText("");
-					viewPane.scrollBack = 0;
-					sendToFork(viewPane.fork, text);
-					return;
-				}
-				super.handleInput(data);
-				return;
-			}
-			if (panelSelId === null) {
-				if (
-					matchesKey(data, "down") &&
-					this.getText() === "" &&
-					forks.size > 0
-				) {
-					selectRow(panelRows(), 0);
-					renderWidget(true);
-					return;
-				}
-				super.handleInput(data);
-				return;
-			}
-			const handled = handlePanelNav(data, {
-				holdAtMain: false,
-				onReturn: (fork) => {
-					if (fork) enterForkView(fork);
-				},
-			});
-			if (!handled) {
-				// Any other key returns focus to the editor and types normally,
-				// like Claude Code's panel (x on the main row included).
+	function handleTerminalInput(data: string, ctx: ExtensionContext): boolean {
+		// Input listeners run before TUI filters key-release events for editors.
+		if (isKeyRelease(data)) return false;
+		refreshMainEditor(ctx);
+		if (!isSubtaskEditorFocused(inputTui, mainEditor)) return false;
+
+		const editorText = ctx.ui.getEditorText();
+		if (viewPane) {
+			if (panelSelId !== null) {
+				const pane = viewPane;
+				const handled = handlePanelNav(data, {
+					holdAtMain: true,
+					onReturn: (target) => {
+						if (!target) exitForkView();
+						else if (target.id !== pane.fork.id) pane.setFork(target);
+					},
+				});
+				if (handled) return true;
 				clearSelection();
 				renderWidget(true);
-				super.handleInput(data);
+				return false;
 			}
+			if (shouldEnterSubtaskPanel(data, editorText, forks.size > 0)) {
+				selectRow(panelRows(), 0);
+				renderWidget(true);
+				return true;
+			}
+			if (matchesKey(data, "escape")) {
+				exitForkView();
+				return true;
+			}
+			if (matchesKey(data, "pageUp")) {
+				viewPane.scrollBy(10);
+				return true;
+			}
+			if (matchesKey(data, "pageDown")) {
+				viewPane.scrollBy(-10);
+				return true;
+			}
+			if (!matchesKey(data, "return")) return false;
+
+			const text = editorText.trim();
+			if (!text) return true;
+			// Built-in commands still act on the main session, like Claude Code's
+			// transcript view.
+			if (text.startsWith("/")) return false;
+			ctx.ui.setEditorText("");
+			viewPane.scrollBack = 0;
+			sendToFork(viewPane.fork, text);
+			return true;
 		}
 
-		render(width: number): string[] {
-			const lines = super.render(width);
-			// Label the input border with the viewed fork, like Claude Code's
-			// @agent-name marker, so it's clear where typed messages go.
-			if (viewPane && lines.length > 0) {
-				const label = ` @${forkName(viewPane.fork.name)} `;
-				const labelWidth = visibleWidth(label);
-				if (visibleWidth(lines[0]) >= labelWidth + 4) {
-					lines[0] =
-						truncateToWidth(lines[0], width - labelWidth - 2, "") +
-						label +
-						"──";
-				}
+		if (panelSelId === null) {
+			if (shouldEnterSubtaskPanel(data, editorText, forks.size > 0)) {
+				selectRow(panelRows(), 0);
+				renderWidget(true);
+				return true;
 			}
-			return lines;
+			return false;
 		}
+
+		const handled = handlePanelNav(data, {
+			holdAtMain: false,
+			onReturn: (fork) => {
+				if (fork) enterForkView(fork);
+			},
+		});
+		if (handled) return true;
+		// Any other key returns focus to the editor and types normally, like
+		// Claude Code's panel (x on the main row included).
+		clearSelection();
+		renderWidget(true);
+		return false;
 	}
 
 	// -------------------------------------------------------------- commands
@@ -1731,19 +1744,22 @@ export default function (pi: ExtensionAPI) {
 		// New session, new UI: the widget must re-register itself.
 		widgetVisible = false;
 		widgetTui = undefined;
+		inputTui = undefined;
+		mainEditor = undefined;
+		mainEditorFactory = undefined;
 		clearSelection();
-		// Inline panel navigation needs an editor wrapper; respect another
-		// extension's custom editor (modal-editor etc.) if one is installed.
-		// Without the wrapper there is no keyboard access to forks.
-		if (ctx.hasUI && !ctx.ui.getEditorComponent()) {
-			ctx.ui.setEditorComponent(
-				(tui, theme, kb) => new SubtaskEditor(tui, theme, kb),
-			);
-		}
+		terminalInputUnsubscribe?.();
+		terminalInputUnsubscribe = ctx.hasUI
+			? ctx.ui.onTerminalInput((data) =>
+				handleTerminalInput(data, ctx) ? { consume: true } : undefined,
+			)
+			: undefined;
 		renderWidget();
 	});
 
 	pi.on("session_shutdown", async () => {
+		terminalInputUnsubscribe?.();
+		terminalInputUnsubscribe = undefined;
 		exitForkView();
 		for (const fork of [...forks.values()]) {
 			const proc = fork.proc;

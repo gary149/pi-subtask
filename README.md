@@ -48,7 +48,7 @@ Finished subtasks stay listed here, so you can always reopen or resume one.
 | `↓` | Switch to another subtask |
 | `Esc` | Back to the main conversation |
 
-Your prompt stays where it is, relabeled `@subtask-name` so you know where your words are going.
+Your prompt stays where it is. The panel identifies the active `@subtask-name` so you know where your words are going.
 
 ## Commands
 
