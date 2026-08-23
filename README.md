@@ -65,13 +65,16 @@ Your prompt stays where it is, relabeled `@subtask-name` so you know where your 
 
 **Noise stays out.** Its greps, file reads, and dead ends live in its own transcript. Your context pays for one message: the result.
 
+**Folds into your tree.** When a subtask finishes, its transcript is grafted into your session as a side branch at the point it was spawned, labeled `subtask: <name>`. Open `/tree` to read it, or navigate onto it and keep typing to continue its work as your main conversation. The branch is ordinary session history: it stays out of your context, survives restarts, and needs no extension to view.
+
 **Real sessions.** A subtask's transcript is an ordinary pi session file. Reopen it any time with `pi --session <file>`.
 
 ## Good to know
 
 - Subtasks share your working tree. Great for investigation; for parallel edits, give each one its own files.
 - A subtask can't spawn more subtasks.
-- Rate-limited subtask? Resume it from the panel, its progress is preserved.
+- Rate-limited subtask? Resume it from the panel, its progress is preserved. Resumed work extends the same `/tree` branch.
+- Quit pi while a subtask runs? Whatever it completed so far is folded into `/tree` before it's stopped, so nothing is lost.
 - The panel needs pi's default editor. If another extension installs a custom one, pi-subtask steps aside.
 
 ## Not to be confused with
