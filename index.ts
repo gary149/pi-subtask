@@ -30,6 +30,10 @@
  *
  * Notes:
  * - Running forks appear in a panel below the editor.
+ * - When a fork finishes (or is stopped, or the session shuts down while it
+ *   runs), its transcript is folded into the parent session as a side branch
+ *   at the spawn point, labeled "subtask: <name>" - browsable later with
+ *   /tree like any branch, with no dependency on this extension.
  * - A fork's transcript is a normal session file: resume it any time with
  *   `pi --session <file>`. Follow-ups respawn it in place.
  *   With --no-session parents, snapshots go to a temp dir and are cleaned up.
@@ -49,6 +53,7 @@ import { uuidv7 } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	SessionEntry,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -57,6 +62,7 @@ import {
 	DynamicBorder,
 	getMarkdownTheme,
 	keyText,
+	SessionManager,
 	ToolExecutionComponent,
 	UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
@@ -120,6 +126,20 @@ interface Fork {
 	/** Parent leaf entry id at spawn time; delivery is skipped if /tree moved
 	 * the conversation onto a branch that doesn't contain it. */
 	parentLeafId: string | null;
+	/** Fork-file id of the last entry already covered by a fold (initially the
+	 * snapshot's last copied entry; null for an empty snapshot). Entries after
+	 * it are the fork's own work, still to be folded. */
+	foldCursorId: string | null;
+	/** Parent-file entry id the next fold chains from: the spawn point at
+	 * first, then the last folded entry, so resumes extend the same branch.
+	 * Null means the branch roots at the top of the tree (empty snapshot). */
+	foldAttachId: string | null;
+	/** Fork-file id -> parent-file id for folded entries, so a later fold can
+	 * remap references (compaction's firstKeptEntryId) across the graft. */
+	foldIdMap: Map<string, string>;
+	/** Parent-file id of the graft's first entry: the "subtask: <name>" label
+	 * target, set by the first fold. */
+	foldHeadId: string | null;
 	/** Working directory the fork runs in (spawn and resume). */
 	cwd: string;
 	/** Model and thinking level pinned at spawn (survives empty snapshots). */
@@ -425,6 +445,7 @@ function writeSnapshot(
 ): {
 	file: string;
 	tempDir?: string;
+	snapshotLeafId: string | null;
 } {
 	const header = ctx.sessionManager.getHeader();
 	const branch = ctx.sessionManager.getBranch();
@@ -457,17 +478,43 @@ function writeSnapshot(
 			parentSession: parentSessionFile,
 		}),
 	];
+	// A compaction boundary may point at a label entry: pi's cut-point scan
+	// swallows adjacent metadata entries into the kept range. Labels are
+	// dropped from the snapshot, so remap such references to the next copied
+	// entry, which starts the same kept range (labels carry no context).
+	const labelRemap = new Map<string, string>();
+	{
+		let pending: string[] = [];
+		for (const entry of branch) {
+			if (entry.type === "label") {
+				pending.push(entry.id);
+			} else {
+				for (const id of pending) labelRemap.set(id, entry.id);
+				pending = [];
+			}
+		}
+	}
 	let parentId: string | null = null;
 	for (const entry of branch) {
 		if (entry.type === "label") continue;
-		lines.push(JSON.stringify({ ...entry, parentId }));
+		const copy: (typeof branch)[number] = { ...entry, parentId };
+		if (copy.type === "compaction" && labelRemap.has(copy.firstKeptEntryId)) {
+			copy.firstKeptEntryId = labelRemap.get(copy.firstKeptEntryId) as string;
+		}
+		lines.push(JSON.stringify(copy));
 		parentId = entry.id;
 	}
 	fs.writeFileSync(file, `${lines.join("\n")}\n`, {
 		encoding: "utf-8",
 		mode: 0o600,
 	});
-	return { file, tempDir: ephemeral ? sessionDir : undefined };
+	// parentId is now the last copied entry: the boundary between inherited
+	// context and the fork's own work, and the spawn point folds attach to.
+	return {
+		file,
+		tempDir: ephemeral ? sessionDir : undefined,
+		snapshotLeafId: parentId,
+	};
 }
 
 const SubtaskToolParams = Type.Object({
@@ -703,6 +750,181 @@ export default function (pi: ExtensionAPI) {
 		).length;
 	}
 
+	/**
+	 * Graft the fork's own transcript (entries after its snapshot) into the
+	 * parent session as a side branch at the spawn point, so finished work is
+	 * browsable with /tree and survives restarts with the session itself.
+	 *
+	 * Pure SessionManager appends of core entry types; no navigation, no UI.
+	 * The live leaf is moved and restored within one synchronous pass, so the
+	 * conversation, its context, and a possibly-streaming turn never observe
+	 * the excursion. Side branches are not on the root-to-leaf path, so the
+	 * graft adds nothing to the parent's LLM context.
+	 *
+	 * Called on every completion. Idempotent across resumes: the cursor
+	 * advances past folded entries and later folds chain onto the previous
+	 * graft, extending the same branch.
+	 */
+	function foldForkIntoTree(fork: Fork) {
+		const ctx = lastCtx;
+		if (!ctx) return;
+		try {
+			// Fold only into the session the fork was spawned from. Unlike result
+			// delivery, the current leaf position doesn't matter: the graft lands
+			// at the spawn point wherever the conversation moved since.
+			if (ctx.sessionManager.getSessionId() !== fork.parentSessionId) return;
+			// Explicit check: SessionManager.open() silently builds an empty
+			// session for a missing path instead of failing.
+			if (!fs.existsSync(fork.sessionFile)) return;
+			// A fork killed mid-write may leave a torn last line; the session
+			// loader skips malformed lines, so this read is safe.
+			const forkBranch = SessionManager.open(fork.sessionFile).getBranch();
+			let suffix: SessionEntry[];
+			if (fork.foldCursorId === null) {
+				suffix = forkBranch;
+			} else {
+				const cursor = forkBranch.findIndex((e) => e.id === fork.foldCursorId);
+				if (cursor === -1) return; // not our snapshot lineage; don't guess
+				suffix = forkBranch.slice(cursor + 1);
+			}
+			// Core transcript content survives the graft; bookkeeping doesn't:
+			// labels are the fork's own bookmarks, session_info would rename the
+			// parent, custom entries are extension state whose replay could leak
+			// the child's state into the parent's, and branch summaries can't
+			// occur in a headless child (slash input in the viewer routes to the
+			// parent). Unknown future types: skip.
+			const retained = new Set([
+				"message",
+				"model_change",
+				"thinking_level_change",
+				"compaction",
+				"custom_message",
+			]);
+			if (!suffix.some((e) => retained.has(e.type))) return;
+
+			// ctx.sessionManager is the live SessionManager behind a readonly
+			// type; folding needs its append/branch methods.
+			const sm = ctx.sessionManager as unknown as SessionManager;
+			if (fork.foldAttachId !== null && !sm.getEntry(fork.foldAttachId)) {
+				return;
+			}
+			const liveLeafId = sm.getLeafId();
+			let firstNewId: string | undefined;
+			/** First grafted entry /tree shows by default; settings entries
+			 * (model/thinking changes) are hidden there, so a label on them
+			 * would be invisible. */
+			let firstVisibleNewId: string | undefined;
+			let lastNewId: string | undefined;
+			/** Fork-file id of the last retained suffix entry; the cursor
+			 * advances only this far, so skipped trailing entries are seen
+			 * again next pass and lazily remapped once something follows. */
+			let lastRetainedId: string | undefined;
+			/** Skipped entries awaiting a forward remap: a compaction boundary
+			 * may point at them (pi's cut-point scan swallows adjacent
+			 * metadata), so alias each to the next retained entry, which
+			 * starts the same kept range. */
+			let pendingSkipped: string[] = [];
+			try {
+				if (fork.foldAttachId === null) sm.resetLeaf();
+				else sm.branch(fork.foldAttachId);
+				for (const e of suffix) {
+					let newId: string;
+					switch (e.type) {
+						case "message":
+							// Compaction/branch summaries never occur as message
+							// entries (SessionManager stores them as dedicated entry
+							// types); the cast only narrows the union.
+							newId = sm.appendMessage(e.message as Message);
+							break;
+						case "model_change":
+							newId = sm.appendModelChange(e.provider, e.modelId);
+							break;
+						case "thinking_level_change":
+							newId = sm.appendThinkingLevelChange(e.thinkingLevel);
+							break;
+						case "compaction":
+							// firstKeptEntryId points either into the shared prefix
+							// (same id in the parent, identity) or into the fork's own
+							// folded work (remapped).
+							newId = sm.appendCompaction(
+								e.summary,
+								fork.foldIdMap.get(e.firstKeptEntryId) ?? e.firstKeptEntryId,
+								e.tokensBefore,
+								e.details,
+								e.fromHook,
+								e.usage,
+							);
+							break;
+						case "custom_message":
+							newId = sm.appendCustomMessageEntry(
+								e.customType,
+								e.content,
+								e.display,
+								e.details,
+							);
+							break;
+						default:
+							pendingSkipped.push(e.id);
+							continue;
+					}
+					fork.foldIdMap.set(e.id, newId);
+					for (const skippedId of pendingSkipped) {
+						fork.foldIdMap.set(skippedId, newId);
+					}
+					pendingSkipped = [];
+					firstNewId ??= newId;
+					if (e.type === "message" || e.type === "custom_message") {
+						firstVisibleNewId ??= newId;
+					}
+					lastNewId = newId;
+					lastRetainedId = e.id;
+				}
+			} finally {
+				if (liveLeafId === null) sm.resetLeaf();
+				else sm.branch(liveLeafId);
+			}
+			if (
+				firstNewId === undefined ||
+				lastNewId === undefined ||
+				lastRetainedId === undefined
+			) {
+				return;
+			}
+			// Advance only after a fully successful pass; a failed pass re-folds
+			// from the old cursor (worst case: duplicate entries in an abandoned
+			// branch, never corruption).
+			// Label target: the graft's first /tree-visible entry. If an earlier
+			// pass had none (fork killed before its first message flushed), a
+			// later pass with a visible entry takes over as the head.
+			const headEntry = fork.foldHeadId ? sm.getEntry(fork.foldHeadId) : undefined;
+			const headHidden =
+				!headEntry ||
+				headEntry.type === "model_change" ||
+				headEntry.type === "thinking_level_change";
+			const prevHeadId = fork.foldHeadId;
+			const headId =
+				prevHeadId === null || (headHidden && firstVisibleNewId)
+					? (firstVisibleNewId ?? firstNewId)
+					: prevHeadId;
+			fork.foldHeadId = headId;
+			fork.foldAttachId = lastNewId;
+			fork.foldCursorId = lastRetainedId;
+			// Label entry on the LIVE path, after the restore, every pass: it
+			// tags the graft's head for /tree (targetId may point anywhere) and,
+			// because a reopened session derives its leaf from the file's last
+			// physical entry, it pins reopening to the main conversation rather
+			// than the graft. Invisible in /tree and inert in LLM context.
+			// A repeat pass re-asserts the label's CURRENT state instead of the
+			// default, so a rename or clear the user made in /tree survives;
+			// the entry's real job here is the reopen-leaf pin.
+			const label =
+				headId !== prevHeadId ? `subtask: ${fork.name}` : sm.getLabel(headId);
+			sm.appendLabelChange(headId, label);
+		} catch (err) {
+			console.error(`subtask: failed to fold "${fork.name}" into /tree:`, err);
+		}
+	}
+
 	function deliverResult(fork: Fork) {
 		const elapsedMs = Date.now() - fork.startedAt;
 		const body =
@@ -784,6 +1006,7 @@ export default function (pi: ExtensionAPI) {
 			text: `── ${status} ──`,
 			ts: Date.now(),
 		});
+		foldForkIntoTree(fork);
 		if (status !== "stopped") deliverResult(fork);
 		// The fork stays in the map (resumable from the panel) but its widget row
 		// ages out; schedule a refresh so the row disappears without new events.
@@ -1022,6 +1245,12 @@ export default function (pi: ExtensionAPI) {
 							? "done"
 							: "failed",
 				);
+			} else {
+				// Completion already folded, but a stopped child persists its
+				// aborted message asynchronously, possibly after that fold read
+				// the file. Now the process is gone the file is final; the
+				// cursor makes this pass pick up only the late entries.
+				foldForkIntoTree(fork);
 			}
 		});
 		proc.on("error", (err) => {
@@ -1068,7 +1297,11 @@ export default function (pi: ExtensionAPI) {
 		if (cwdOverride && !fs.existsSync(cwd)) {
 			return `working directory does not exist: ${cwd}`;
 		}
-		let snapshot: { file: string; tempDir?: string };
+		let snapshot: {
+			file: string;
+			tempDir?: string;
+			snapshotLeafId: string | null;
+		};
 		try {
 			snapshot = writeSnapshot(ctx, cwd);
 		} catch (err) {
@@ -1091,6 +1324,10 @@ export default function (pi: ExtensionAPI) {
 			lastTotalTokens: 0,
 			parentSessionId: ctx.sessionManager.getSessionId(),
 			parentLeafId: ctx.sessionManager.getLeafId(),
+			foldCursorId: snapshot.snapshotLeafId,
+			foldAttachId: snapshot.snapshotLeafId,
+			foldIdMap: new Map(),
+			foldHeadId: null,
 			cwd,
 			transcript: [],
 			promptAccepted: false,
@@ -1749,6 +1986,12 @@ export default function (pi: ExtensionAPI) {
 			const proc = fork.proc;
 			if (proc && proc.exitCode === null) {
 				fork.completed = true;
+				// Best effort: fold whatever the fork flushed so far, so work in
+				// flight at shutdown survives in /tree instead of being orphaned
+				// in a file the resumed session no longer knows about. Folding
+				// reads the file as-is; the kill below races only lines the
+				// child hadn't flushed yet.
+				foldForkIntoTree(fork);
 				proc.kill("SIGTERM");
 			}
 			removeFork(fork);
