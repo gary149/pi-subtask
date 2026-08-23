@@ -842,19 +842,29 @@ export default function (pi: ExtensionAPI) {
 						case "thinking_level_change":
 							newId = sm.appendThinkingLevelChange(e.thinkingLevel);
 							break;
-						case "compaction":
-							// firstKeptEntryId points either into the shared prefix
-							// (same id in the parent, identity) or into the fork's own
-							// folded work (remapped).
+						case "compaction": {
+							// firstKeptEntryId: shared-prefix ids pass through (the
+							// same id exists in the parent), folded ids remap. A
+							// boundary pointing at metadata skipped in THIS pass with
+							// nothing retained in between (possible with extension-
+							// provided compaction) aliases to the graft's current
+							// tip, the closest surviving entry, so the boundary
+							// stays valid in the parent instead of dangling.
+							const kept =
+								fork.foldIdMap.get(e.firstKeptEntryId) ??
+								(pendingSkipped.includes(e.firstKeptEntryId)
+									? (lastNewId ?? fork.foldAttachId ?? e.firstKeptEntryId)
+									: e.firstKeptEntryId);
 							newId = sm.appendCompaction(
 								e.summary,
-								fork.foldIdMap.get(e.firstKeptEntryId) ?? e.firstKeptEntryId,
+								kept,
 								e.tokensBefore,
 								e.details,
 								e.fromHook,
 								e.usage,
 							);
 							break;
+						}
 						case "custom_message":
 							newId = sm.appendCustomMessageEntry(
 								e.customType,
