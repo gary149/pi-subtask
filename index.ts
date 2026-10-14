@@ -44,7 +44,7 @@
  * - A fork can't spawn further forks (PI_SUBTASK_CHILD guard).
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1013,6 +1013,41 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+/**
+ * Every process below `pid`. Killing the child is not enough: pi runs each
+ * shell command in its own process group, so a command the child started is a
+ * grandchild in a different group and would outlive the fork that owns it.
+ * `ps` keeps this working on macOS as well as on Linux.
+ */
+function descendantPids(pid: number): number[] {
+	try {
+		const out = execFileSync("ps", ["-Ao", "pid=,ppid="], {
+			encoding: "utf-8",
+		});
+		const children = new Map<number, number[]>();
+		for (const line of out.split("\n")) {
+			const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+			if (!match) continue;
+			const child = Number(match[1]);
+			const parent = Number(match[2]);
+			const list = children.get(parent);
+			if (list) list.push(child);
+			else children.set(parent, [child]);
+		}
+		const descendants: number[] = [];
+		const walk = (parent: number) => {
+			for (const child of children.get(parent) ?? []) {
+				walk(child);
+				descendants.push(child);
+			}
+		};
+		walk(pid);
+		return descendants;
+	} catch {
+		return [];
+	}
+}
+
 	function completeFork(fork: Fork, status: "done" | "failed" | "stopped") {
 		if (fork.completed) return;
 		fork.completed = true;
@@ -1029,9 +1064,26 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				/* ignore */
 			}
+			// Snapshot the tree before signalling it: once the child dies its
+			// children are reparented and can no longer be found from here.
+			const descendants = proc.pid ? descendantPids(proc.pid) : [];
+			const signal = (pids: number[], sig: "SIGTERM" | "SIGKILL") => {
+				for (const pid of pids) {
+					try {
+						process.kill(pid, sig);
+					} catch {
+						/* already gone */
+					}
+				}
+			};
 			setTimeout(() => {
 				if (proc.exitCode === null) proc.kill("SIGKILL");
+				// Only the snapshot taken above: a command that ignored SIGTERM is
+				// still alive by pid, and re-walking the tree would miss children the
+				// dead child already orphaned.
+				signal(descendants, "SIGKILL");
 			}, KILL_GRACE_MS);
+			signal(descendants, "SIGTERM");
 			proc.kill("SIGTERM");
 		}
 		pushTranscriptItem(fork, {
