@@ -33,6 +33,7 @@ Press `↓` on an empty prompt to jump into the subtask rows under the editor.
 | `↑` `↓` | Move between rows |
 | `Enter` | Open the subtask's live transcript (or return to `main`) |
 | `x` | Stop a running subtask, dismiss a finished one |
+| `k` | Abort the command the selected subtask is running (keeps its context) |
 | `Esc` | Back to typing |
 
 Finished subtasks stay listed here, so you can always reopen or resume one.
@@ -44,6 +45,7 @@ Finished subtasks stay listed here, so you can always reopen or resume one.
 | Key | Action |
 | --- | --- |
 | *type + `Enter`* | Send a message. Steers the subtask while it runs, resumes it once finished |
+| `k` | Abort the command it is running (keeps its context) |
 | `PageUp` `PageDown` | Scroll |
 | `↓` | Switch to another subtask |
 | `Esc` | Back to the main conversation |
