@@ -83,6 +83,8 @@ const FAILED_ROW_LINGER_MS = 30_000;
 const MAX_RETAINED_FINISHED = 20;
 const RESULT_CAP_BYTES = 50 * 1024;
 const KILL_GRACE_MS = 3_000;
+/** How long the child gets to settle after `abort` before we finish it ourselves. */
+const ABORT_GRACE_MS = 10_000;
 const MAX_TRANSCRIPT_ITEMS = 500;
 const MAX_MODEL_FORKS = 8;
 
@@ -151,6 +153,12 @@ interface Fork {
 	lastTotalTokens: number;
 	tps?: number;
 	turnStartedAt?: number;
+	/** The tool call the fork is running right now, if any. */
+	activeTool?: { name: string; toolCallId: string; startedAt: number };
+	/** Set while the user has asked to abort that tool. */
+	abortingTool?: boolean;
+	/** Fallback timer that finishes the fork if the abort never settles. */
+	abortTimer?: ReturnType<typeof setTimeout>;
 	/** Ring buffer of transcript items feeding the live viewer. */
 	transcript: TranscriptItem[];
 	/** Set by an open viewer so new items trigger a repaint. */
@@ -608,11 +616,22 @@ export default function (pi: ExtensionAPI) {
 		const rows = panelSelId === null && !viewPane ? widgetRows() : panelRows();
 		const selIdx = panelIndex(rows);
 		const viewedId = viewPane?.fork.id;
+		// Advertise the abort key only when there is a command to abort, so it
+		// appears exactly when a fork looks stuck on a tool.
+		const abortable = viewPane
+			? viewPane.fork
+			: selIdx !== null && selIdx > 0
+				? rows[selIdx - 1]
+				: undefined;
+		const abortHint =
+			abortable && !abortable.completed && abortable.activeTool
+				? " · k abort command"
+				: "";
 		const hint = viewPane
-			? `viewing @${viewPane.fork.name} — typing goes to the fork · ↓ switch · esc back to main`
+			? `viewing @${viewPane.fork.name} — typing goes to the fork${abortHint} · ↓ switch · esc back to main`
 			: selIdx === null
 				? `subtasks (${rows.length}) — ↓ to select`
-				: "enter to view · x to stop/dismiss · esc back";
+				: `enter to view${abortHint} · x to stop/dismiss · esc back`;
 		const lines = [truncateToWidth(hint, width, "…")];
 		// Filled marker = the view you're in, hollow = the others (Claude Code).
 		lines.push(
@@ -998,6 +1017,10 @@ export default function (pi: ExtensionAPI) {
 		if (fork.completed) return;
 		fork.completed = true;
 		fork.status = status;
+		if (fork.abortTimer) clearTimeout(fork.abortTimer);
+		fork.abortTimer = undefined;
+		fork.abortingTool = false;
+		fork.activeTool = undefined;
 		const proc = fork.proc;
 		fork.proc = null;
 		if (proc && proc.exitCode === null) {
@@ -1132,6 +1155,12 @@ export default function (pi: ExtensionAPI) {
 					const name = String(event.toolName ?? "tool");
 					const args = (event.args as Record<string, unknown>) ?? {};
 					fork.activity = formatActivity(name, args);
+					fork.activeTool = {
+						name,
+						toolCallId: String(event.toolCallId ?? ""),
+						startedAt: Date.now(),
+					};
+					fork.abortingTool = false;
 					pushTranscriptItem(fork, {
 						type: "tool",
 						name,
@@ -1145,6 +1174,12 @@ export default function (pi: ExtensionAPI) {
 					// Attach the result to its tool item so the pane can render it
 					// with pi's own ToolExecutionComponent.
 					const toolCallId = String(event.toolCallId ?? "");
+					if (fork.activeTool?.toolCallId === toolCallId) {
+						// Keep abortingTool: the settle that follows this tool end is
+						// what turns the abort into a stopped fork, and completing it as
+						// done would deliver a result nobody produced.
+						fork.activeTool = undefined;
+					}
 					const item = [...fork.transcript]
 						.reverse()
 						.find(
@@ -1202,7 +1237,17 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "agent_settled": {
 					if (fork.promptAccepted && fork.agentStarted) {
-						completeFork(fork, fork.errorText ? "failed" : "done");
+						// An abort the user asked for is not a result: keep the fork (and
+						// its transcript, resumable from the panel) instead of reporting
+						// a finished subtask nobody finished.
+						completeFork(
+							fork,
+							fork.abortingTool
+								? "stopped"
+								: fork.errorText
+									? "failed"
+									: "done",
+						);
 					}
 					break;
 				}
@@ -1561,6 +1606,9 @@ export default function (pi: ExtensionAPI) {
 		| "agentStarted"
 		| "completed"
 		| "finishedAt"
+		| "activeTool"
+		| "abortingTool"
+		| "abortTimer"
 	> {
 		return {
 			status: "starting",
@@ -1571,7 +1619,45 @@ export default function (pi: ExtensionAPI) {
 			agentStarted: false,
 			completed: false,
 			finishedAt: undefined,
+			activeTool: undefined,
+			abortingTool: undefined,
+			abortTimer: undefined,
 		};
+	}
+
+	/**
+	 * Abort the command the fork is running right now, keeping the fork.
+	 *
+	 * `abort` rather than killing the child: the child's own pi closes the turn
+	 * it is in (the running tool is killed, the transcript and session file stay
+	 * consistent) and the fork keeps everything it learned, so it can be
+	 * continued from the panel instead of being thrown away and restarted.
+	 */
+	function abortForkCommand(fork: Fork | undefined): boolean {
+		if (!fork || fork.completed || !fork.proc || !fork.activeTool) return false;
+		const tool = fork.activeTool;
+		fork.abortingTool = true;
+		pushTranscriptItem(fork, {
+			type: "system",
+			text: `── aborting ${tool.name} ──`,
+			ts: Date.now(),
+		});
+		fork.proc.stdin?.write(`${JSON.stringify({ type: "abort" })}\n`);
+		// The child normally answers with agent_settled, which completes the fork
+		// as stopped. A command that ignores the abort would leave it "running"
+		// forever, so finish it here instead.
+		if (fork.abortTimer) clearTimeout(fork.abortTimer);
+		fork.abortTimer = setTimeout(() => {
+			if (fork.completed || !fork.abortingTool) return;
+			pushTranscriptItem(fork, {
+				type: "system",
+				text: "── no settle after the abort ──",
+				ts: Date.now(),
+			});
+			completeFork(fork, "stopped");
+		}, ABORT_GRACE_MS);
+		renderWidget(true);
+		return true;
 	}
 
 	function stopOrDismissFork(fork: Fork) {
@@ -1612,6 +1698,10 @@ export default function (pi: ExtensionAPI) {
 			renderWidget(true);
 			opts.onReturn(target);
 			return true;
+		} else if (matchesKey(data, "k") && idx > 0) {
+			// Abort the selected fork's running command. Unhandled when there is
+			// nothing to abort, so the key types normally.
+			if (!abortForkCommand(rows[idx - 1])) return false;
 		} else if (matchesKey(data, "x") && idx > 0) {
 			const fork = rows[idx - 1];
 			// Identity-tracked: the cursor follows this fork through the
@@ -1666,6 +1756,9 @@ export default function (pi: ExtensionAPI) {
 				}
 				if (matchesKey(data, "escape")) {
 					exitForkView();
+					return;
+				}
+				if (matchesKey(data, "k") && abortForkCommand(viewPane.fork)) {
 					return;
 				}
 				if (matchesKey(data, "pageUp")) {
